@@ -1,0 +1,1116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>MemeTracker — Dogecoin mempool watcher</title>
+  <link rel="icon" href="/logo.png" type="image/png"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Comic+Neue:ital,wght@0,300;0,400;0,700;1,300;1,400&display=swap" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet"/>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c1018;
+      --surface: #151d2c;
+      --surface2: #1c2638;
+      --text: #e8edf5;
+      --muted: #8b9cb8;
+      --accent: #f2a900;
+      --accent-dim: #c2a633;
+      --danger: #e85d5d;
+      --ok: #5dbe8a;
+      --border: rgba(255,255,255,.08);
+      --radius: 10px;
+      --font: "Comic Neue", "Comic Sans MS", cursive, system-ui, sans-serif;
+      --sidebar-w: 280px;
+      --sidebar-rail: 72px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      background: radial-gradient(1000px 500px at 0% 0%, rgba(242,169,0,.08), transparent),
+        radial-gradient(800px 400px at 100% 0%, rgba(194,166,51,.06), transparent), var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .nav-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.45);
+      z-index: 90;
+      opacity: 0;
+      transition: opacity .2s;
+    }
+    .nav-backdrop.visible { display: block; opacity: 1; }
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: min(var(--sidebar-w), 88vw);
+      height: 100vh;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      z-index: 100;
+      transform: translateX(-100%);
+      transition: transform .22s ease;
+      display: flex;
+      flex-direction: column;
+      padding: 1rem 0 2rem;
+      overflow-y: auto;
+    }
+    .sidebar.open { transform: translateX(0); }
+    .material-icons {
+      font-family: "Material Icons";
+      font-weight: normal;
+      font-style: normal;
+      font-size: 1.25rem;
+      line-height: 1;
+      letter-spacing: normal;
+      text-transform: none;
+      display: inline-block;
+      white-space: nowrap;
+      word-wrap: normal;
+      direction: ltr;
+      vertical-align: -0.2em;
+      -webkit-font-smoothing: antialiased;
+    }
+    .btn .material-icons { font-size: 1.1rem; vertical-align: middle; }
+    .btn-sm .material-icons { font-size: 1rem; }
+    .btn-with-icon, .side-nav button { display: inline-flex; align-items: center; gap: .45rem; }
+    .side-nav .material-icons.side-nav-ico { font-size: 1.35rem; opacity: .95; flex-shrink: 0; }
+    .sidebar-brand {
+      padding: 0 1rem 1rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: .75rem;
+    }
+    .sidebar-brand img { width: 40px; height: 40px; vertical-align: middle; margin-right: .5rem; }
+    .sidebar-brand strong { font-size: 1.05rem; display: block; margin-top: .35rem; }
+    .sidebar-brand span { font-size: .75rem; color: var(--muted); }
+    .sidebar-close {
+      position: absolute;
+      top: .5rem;
+      right: .5rem;
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: .25rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .sidebar-close:hover { color: var(--text); }
+    .sidebar-close .material-icons { font-size: 1.5rem; }
+    .side-nav { display: flex; flex-direction: column; gap: .15rem; padding: 0 .5rem; }
+    .side-nav button {
+      justify-content: flex-start;
+      padding: .65rem 1rem;
+      border: none;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--text);
+      font-size: .92rem;
+      cursor: pointer;
+      width: 100%;
+      font-family: inherit;
+    }
+    .side-nav button:hover { background: var(--surface2); }
+    .side-nav button.active { background: rgba(242,169,0,.18); color: var(--accent); font-weight: 600; }
+    .page-wrap { min-height: 100vh; display: flex; flex-direction: column; }
+    header.topbar {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      padding: .75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(21,29,44,.88);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .nav-hamburger, .nav-sidebar-toggle {
+      flex-shrink: 0;
+      width: 42px;
+      height: 42px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+    .nav-hamburger:hover, .nav-sidebar-toggle:hover { border-color: var(--accent-dim); }
+    .nav-sidebar-toggle { display: none; }
+    .nav-sidebar-toggle .material-icons { font-size: 1.35rem; }
+    .topbar-titles { min-width: 0; }
+    .topbar-titles h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -.02em;
+    }
+    .topbar-titles .sub { color: var(--muted); margin: 0; font-size: .78rem; }
+    main.main-content {
+      flex: 1;
+      max-width: 1200px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 1rem 1rem 3rem;
+    }
+    @media (min-width: 880px) {
+      .nav-backdrop { display: none !important; }
+      .sidebar {
+        transform: translateX(0);
+        box-shadow: 4px 0 24px rgba(0,0,0,.2);
+        width: var(--sidebar-w);
+      }
+      body.sidebar-rail .sidebar {
+        width: var(--sidebar-rail);
+      }
+      body.sidebar-rail .sidebar-brand strong,
+      body.sidebar-rail .sidebar-brand > span,
+      body.sidebar-rail .side-nav .side-nav-label {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0,0,0,0);
+        white-space: nowrap;
+        border: 0;
+      }
+      body.sidebar-rail .sidebar-brand > div { display: flex; justify-content: center; }
+      body.sidebar-rail .sidebar-brand img { margin: 0 !important; }
+      body.sidebar-rail .side-nav button {
+        justify-content: center;
+        padding: .65rem .4rem;
+      }
+      body.sidebar-rail .page-wrap {
+        margin-left: var(--sidebar-rail) !important;
+      }
+      .sidebar-close { display: none; }
+      .nav-hamburger { display: none; }
+      .nav-sidebar-toggle { display: inline-flex; }
+      .page-wrap { margin-left: var(--sidebar-w); transition: margin-left .22s ease; }
+    }
+    section.panel { display: none; }
+    section.panel.active { display: block; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.15rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .card h2 { margin: 0 0 .75rem; font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-dim); }
+    .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: .85rem; }
+    .stat { padding: .85rem; background: var(--surface2); border-radius: 8px; border: 1px solid var(--border); }
+    .statVAL { font-size: 1.25rem; font-weight: 700; color: var(--accent); }
+    .statLBL { font-size: .8rem; color: var(--muted); }
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -.25rem; padding: 0 .25rem; }
+    table.responsive { width: 100%; border-collapse: collapse; font-size: .85rem; min-width: 520px; }
+    .responsive th, .responsive td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .responsive th { color: var(--muted); font-weight: 600; font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; }
+    .responsive tr:hover td { background: rgba(255,255,255,.03); }
+    @media (max-width: 720px) {
+      table.responsive { min-width: 0; }
+      table.responsive thead { display: none; }
+      table.responsive tr { display: block; border: 1px solid var(--border); border-radius: 8px; margin-bottom: .65rem; background: var(--surface2); }
+      table.responsive td {
+        display: block; text-align: right; padding: .45rem .65rem;
+        border-bottom: 1px solid var(--border);
+      }
+      table.responsive td:last-child { border-bottom: none; }
+      table.responsive td::before {
+        content: attr(data-label);
+        float: left; font-weight: 600; color: var(--muted); font-size: .72rem;
+        text-transform: uppercase; letter-spacing: .04em; max-width: 45%;
+        text-align: left;
+      }
+      table.responsive td.row-actions { text-align: center; }
+      table.responsive td.row-actions::before { float: none; display: block; margin-bottom: .35rem; }
+    }
+    .mono { font-family: ui-monospace, "Cascadia Code", monospace; font-size: .82em; word-break: break-all; }
+    .btn {
+      display: inline-flex; align-items: center; gap: .35rem; padding: .35rem .6rem; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text); cursor: pointer; font-size: .78rem; font-family: inherit;
+    }
+    a.btn { text-decoration: none; }
+    .btn:hover { border-color: var(--accent-dim); }
+    .btn-sm { padding: .25rem .45rem; font-size: .72rem; }
+    .btn-danger { border-color: rgba(232,93,93,.5); color: var(--danger); }
+    .btn-ghost { background: transparent; }
+    label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: .25rem; }
+    input, select, textarea {
+      width: 100%; max-width: 100%; padding: .5rem .65rem; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); margin-bottom: .75rem; font-family: inherit;
+    }
+    textarea.code { min-height: 88px; font-family: ui-monospace, monospace; font-size: .8rem; }
+    .muted { color: var(--muted); font-size: .88rem; }
+    .help-block h3 { font-size: .95rem; margin: 1.25rem 0 .5rem; color: var(--accent-dim); }
+    .help-block pre, .help-block code {
+      background: rgba(0,0,0,.25); border: 1px solid var(--border); border-radius: 8px;
+      padding: .75rem; overflow-x: auto; font-size: .76rem; display: block; white-space: pre-wrap; word-break: break-all;
+    }
+    .msg { padding: .65rem .85rem; border-radius: 8px; margin: .5rem 0; font-size: .88rem; }
+    .msg.ok { background: rgba(93,190,138,.12); border: 1px solid rgba(93,190,138,.35); }
+    .msg.err { background: rgba(232,93,93,.12); border: 1px solid rgba(232,93,93,.35); }
+    .pill { display: inline-block; font-size: .68rem; font-weight: 600; padding: .15rem .4rem; border-radius: 999px; background: rgba(93,190,138,.2); color: var(--ok); }
+    .pill.off { background: rgba(139,156,184,.2); color: var(--muted); }
+    .banner-start {
+      background: linear-gradient(135deg, rgba(242,169,0,.18), rgba(28,38,56,.9));
+      border: 1px solid rgba(242,169,0,.35); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 1rem;
+    }
+    .banner-start h2 { margin: 0 0 .75rem; font-size: .85rem; text-transform: uppercase; letter-spacing: .06em; color: var(--accent); }
+    .btn-primary { background: rgba(242,169,0,.25); border-color: var(--accent); color: var(--accent); font-weight: 600; padding: .5rem 1.25rem; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0 1rem; }
+    .hidden { display: none !important; }
+    .track-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: flex-end; margin-bottom: 1rem; }
+    .track-row input { margin-bottom: 0; flex: 1; min-width: 160px; }
+    .tx-links { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; justify-content: flex-end; }
+    .modal-root {
+      position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center;
+      padding: 1rem; background: rgba(0,0,0,.55); backdrop-filter: blur(4px);
+    }
+    .modal-root.hidden { display: none; }
+    .modal-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 1.35rem 1.5rem; max-width: 420px; width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,.4);
+    }
+    .modal-card h3 { margin: 0 0 .65rem; font-size: 1.1rem; }
+    .modal-card .modal-body { margin: 0 0 1.15rem; line-height: 1.55; }
+    .modal-actions { display: flex; gap: .5rem; justify-content: flex-end; flex-wrap: wrap; }
+    .dash-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: .75rem; margin-bottom: .75rem; }
+    .dash-head h2 { margin: 0; }
+    .dash-meta { font-size: .72rem; color: var(--muted); text-align: right; }
+    .dash-meta strong { color: var(--accent-dim); font-weight: 600; }
+    .stat-rownote { font-size: .7rem; color: var(--muted); margin-top: .35rem; line-height: 1.35; }
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+      margin-top: .5rem;
+    }
+    .chart-box {
+      position: relative;
+      height: 210px;
+      padding: .5rem .25rem .25rem;
+      background: var(--surface2);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .chart-box .chart-title {
+      font-size: .68rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+      margin: 0 0 .35rem .35rem;
+    }
+    .txid-line { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .4rem; max-width: 100%; vertical-align: middle; }
+    .copy-tx-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      padding: .15rem .38rem;
+      border-radius: 6px;
+      border: 1px solid rgba(242,169,0,.45);
+      background: rgba(242,169,0,.14);
+      color: var(--accent);
+      cursor: pointer;
+      font: inherit;
+      line-height: 1;
+      vertical-align: middle;
+    }
+    .copy-tx-badge:hover { border-color: var(--accent); background: rgba(242,169,0,.22); }
+    .copy-tx-badge .material-icons { font-size: .95rem; }
+    td.txid-cell { word-break: break-all; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div id="nav-backdrop" class="nav-backdrop" aria-hidden="true"></div>
+  <aside id="sidebar" class="sidebar" aria-label="Main navigation">
+    <button type="button" class="sidebar-close" id="sidebar-close" aria-label="Close menu"><span class="material-icons" aria-hidden="true">close</span></button>
+    <div class="sidebar-brand">
+      <div><img src="/logo.png" alt="" width="40" height="40"/><strong>MemeTracker</strong></div>
+      <span>Dogecoin mempool watcher</span>
+    </div>
+    <nav class="side-nav">
+      <button type="button" class="active" data-tab="dash"><span class="material-icons side-nav-ico" aria-hidden="true">dashboard</span><span class="side-nav-label">Dashboard</span></button>
+      <button type="button" data-tab="cfg"><span class="material-icons side-nav-ico" aria-hidden="true">tune</span><span class="side-nav-label">Configuration</span></button>
+      <button type="button" data-tab="add"><span class="material-icons side-nav-ico" aria-hidden="true">add_circle</span><span class="side-nav-label">Track address</span></button>
+      <button type="button" data-tab="addr"><span class="material-icons side-nav-ico" aria-hidden="true">account_balance_wallet</span><span class="side-nav-label">Tracked addresses</span></button>
+      <button type="button" data-tab="tx"><span class="material-icons side-nav-ico" aria-hidden="true">receipt_long</span><span class="side-nav-label">Transactions</span></button>
+      <button type="button" data-tab="peers"><span class="material-icons side-nav-ico" aria-hidden="true">device_hub</span><span class="side-nav-label">Peers &amp; mempool</span></button>
+      <button type="button" data-tab="security"><span class="material-icons side-nav-ico" aria-hidden="true">shield</span><span class="side-nav-label">API access (IPs)</span></button>
+      <button type="button" data-tab="help"><span class="material-icons side-nav-ico" aria-hidden="true">menu_book</span><span class="side-nav-label">Help &amp; API docs</span></button>
+    </nav>
+  </aside>
+
+  <div class="page-wrap">
+    <header class="topbar">
+      <button type="button" class="nav-hamburger" id="nav-open" aria-label="Open menu" aria-expanded="false"><span class="material-icons" aria-hidden="true">menu</span></button>
+      <button type="button" class="nav-sidebar-toggle" id="nav-sidebar-toggle" title="Collapse or expand sidebar" aria-label="Collapse or expand sidebar"><span class="material-icons" id="nav-sidebar-toggle-icon" aria-hidden="true">chevron_left</span></button>
+      <div class="topbar-titles">
+        <h1>MemeTracker</h1>
+        <p class="sub">Dashboard — use the menu to navigate</p>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <div id="flash"></div>
+
+      <div id="wizard-banner" class="banner-start">
+        <h2>Start MemeTracker</h2>
+        <p class="muted" style="margin:0 0 1rem">P2P mempool watching is <strong>off</strong> until you save a complete configuration and click Start, or place a complete <span class="mono">memetracker_config.json</span> and restart. HTTP port / bind apply after <strong>restart</strong> once saved.</p>
+        <form id="form-start">
+          <div class="form-grid">
+            <div><label>HTTP port (next restart)</label><input name="http_port" type="number" min="1" max="65535" required/></div>
+            <div><label>HTTP bind (next restart)</label><input name="http_bind" type="text" placeholder="0.0.0.0" required/></div>
+            <div><label>Network</label>
+              <select name="network" required>
+                <option value="mainnet">mainnet</option>
+                <option value="testnet">testnet</option>
+              </select>
+            </div>
+            <div><label>Data directory</label><input name="storage_dir" type="text" placeholder="path for addresses/"/></div>
+            <div><label>Max txs per address</label><input name="list_limit" type="number" min="1" max="10000" required/></div>
+            <div><label>Retention (days)</label><input name="retention_days" type="number" min="1" max="3650" required/></div>
+            <div><label>P2P host (optional)</label><input name="p2p_host" type="text" placeholder="empty = DNS seeds"/></div>
+            <div><label>P2P port</label><input name="p2p_port" type="number" min="1" max="65535" required/></div>
+            <div><label>P2P parallel workers (1–8)</label><input name="p2p_parallel" type="number" min="1" max="8" required/></div>
+            <div><label>P2P log level (0–2)</label><input name="p2p_log" type="number" min="0" max="2" required/></div>
+          </div>
+          <div style="grid-column:1/-1">
+            <label>API allowed IPs (optional)</label>
+            <textarea class="code" name="api_allowed_ips_text" rows="3" placeholder="One per line or comma-separated. Empty = allow all. Example:&#10;127.0.0.1&#10;192.168.1.0/24"></textarea>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Restrict <span class="mono">/api/*</span> and <span class="mono">/track/*</span>. Include <span class="mono">127.0.0.1</span> if you use this UI locally when listing specific IPs.</p>
+          </div>
+          <p style="margin:1rem 0 .5rem"><button type="submit" class="btn btn-primary btn-with-icon" id="btn-start"><span class="material-icons" aria-hidden="true">play_arrow</span><span>Start MemeTracker</span></button></p>
+        </form>
+        <p class="muted" style="margin:0;font-size:.8rem">Config file: <span class="mono" id="cfg-path-hint">—</span></p>
+      </div>
+
+      <div id="running-banner" class="banner-start hidden" style="border-color: rgba(93,190,138,.35); background: linear-gradient(135deg, rgba(93,190,138,.12), rgba(28,38,56,.9));">
+        <p style="margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:.75rem">
+          <span><span class="pill">P2P running</span> Workers stop between peer sessions (long sessions may take up to a few minutes).</span>
+          <button type="button" class="btn btn-danger btn-with-icon" id="btn-stop"><span class="material-icons" aria-hidden="true">stop</span><span>Stop P2P</span></button>
+        </p>
+      </div>
+
+      <section id="panel-dash" class="panel active">
+        <div class="card">
+          <div class="dash-head">
+            <div>
+              <h2>Overview</h2>
+              <p class="muted" style="margin:.35rem 0 0">Live snapshot from the server. Mempool and worker counts move while P2P is running.</p>
+            </div>
+            <div class="dash-meta" id="dash-meta">
+              <span id="dash-updated">—</span><br/>
+              <span>Poll <strong>~4s</strong> · mempool = unique txids on the wire</span>
+            </div>
+          </div>
+          <div class="grid2" id="dash-stats"></div>
+        </div>
+        <div class="card">
+          <h2>Live trends</h2>
+          <p class="muted" style="margin-top:.25rem">Charts accumulate samples from this tab while it is open (~every 4 seconds). Reload clears history.</p>
+          <div class="chart-grid">
+            <div class="chart-box">
+              <div class="chart-title">Mempool · unique tx ids seen</div>
+              <canvas id="chart-mempool" aria-label="Mempool count over time"></canvas>
+            </div>
+            <div class="chart-box">
+              <div class="chart-title">P2P · workers with an active peer</div>
+              <canvas id="chart-peers" aria-label="Connected workers over time"></canvas>
+            </div>
+            <div class="chart-box">
+              <div class="chart-title">MemeTracker · stored rows &amp; addresses</div>
+              <canvas id="chart-store" aria-label="Stored data over time"></canvas>
+            </div>
+          </div>
+        </div>
+        <p class="muted">Automation base URL: <span class="mono" id="api-base"></span></p>
+      </section>
+
+      <section id="panel-cfg" class="panel">
+        <div class="card">
+          <h2>Runtime settings</h2>
+          <p class="muted">Updates <span class="mono">settings.json</span> and applies list cap / retention immediately. Does not change P2P or HTTP bind until you edit the main config and restart.</p>
+          <form id="form-cfg">
+            <label>Max stored transactions per address</label>
+            <input name="list_limit" type="number" min="1" max="10000"/>
+            <label>Retention (days) after last /track refresh</label>
+            <input name="retention_days" type="number" min="1" max="3650"/>
+            <button type="submit" class="btn btn-with-icon"><span class="material-icons" aria-hidden="true">save</span><span>Save settings</span></button>
+          </form>
+        </div>
+        <div class="card">
+          <h2>Effective configuration (read-only)</h2>
+          <pre id="cfg-readonly" class="mono" style="margin:0;font-size:.78rem;white-space:pre-wrap;"></pre>
+        </div>
+      </section>
+
+      <section id="panel-add" class="panel">
+        <div class="card">
+          <h2>Track address</h2>
+          <p class="muted">Registers a <strong>P2PKH</strong> (legacy base58) address. Requires P2P running. Refreshes retention timer on each call.</p>
+          <div class="track-row">
+            <input id="track-addr" type="text" placeholder="Mainnet P2PKH address…"/>
+            <button type="button" class="btn btn-with-icon" id="btn-track"><span class="material-icons" aria-hidden="true">add_location_alt</span><span>Track</span></button>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-addr" class="panel">
+        <div class="card">
+          <h2>Tracked addresses</h2>
+          <p class="muted">Persisted under your data directory. Remove clears the address file and all stored txs for it.</p>
+          <div class="table-wrap">
+            <table class="responsive" id="table-addr">
+              <thead><tr><th>Address</th><th>Hash160</th><th>Tracked since</th><th>Last refresh</th><th>Tx count</th><th></th></tr></thead>
+              <tbody id="tbody-addr"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-tx" class="panel">
+        <div class="card">
+          <h2>Transactions</h2>
+          <p class="muted">Rows detected from mempool traffic paying your watched addresses. Use the copy badge after each txid, or open on sochain.</p>
+          <div class="table-wrap">
+            <table class="responsive" id="table-tx">
+              <thead><tr><th>Time (UTC)</th><th>Address</th><th>Txid</th><th>DOGE</th><th>Explorer / remove</th></tr></thead>
+              <tbody id="tbody-tx"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-peers" class="panel">
+        <div class="card">
+          <h2>Peers &amp; mempool</h2>
+          <p class="muted">Parallel workers each maintain one session at a time. Mempool count = unique tx ids recently seen on the wire.</p>
+          <div class="grid2" id="peer-stats"></div>
+          <div class="table-wrap" style="margin-top:1rem">
+            <table class="responsive" id="table-peers">
+              <thead><tr><th>Worker</th><th>Peer</th><th>Status</th><th>Updated</th></tr></thead>
+              <tbody id="tbody-peers"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-security" class="panel">
+        <div class="card">
+          <h2>API IP access</h2>
+          <p class="muted">When the list is <strong>empty</strong>, all IPs may call <span class="mono">/api/*</span> and <span class="mono">/track/*</span>. When you add entries, only matching IPv4/IPv6 addresses or CIDR ranges can use those paths (this page still loads; include <span class="mono">127.0.0.1</span> for local dashboard refresh). Behind a reverse proxy, set env <span class="mono">MTR_TRUST_XFF=1</span> on the server — see README.</p>
+          <form id="form-allowlist">
+            <label>Allowed IPs / CIDRs (one per line)</label>
+            <textarea class="code" id="allowlist-text" name="allowlist" rows="5" placeholder="127.0.0.1&#10;10.0.0.0/8"></textarea>
+            <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">vpn_key</span><span>Save API allowlist</span></button>
+          </form>
+        </div>
+      </section>
+
+      <section id="panel-help" class="panel">
+        <div class="card help-block">
+          <h2>How MemeTracker works</h2>
+          <p>MemeTracker connects to the Dogecoin P2P network, requests the mempool, and listens for transaction inventory and raw transactions. It does <strong>not</strong> sync the blockchain. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, time, and DOGE amount and stores it under your data directory.</p>
+          <h3>Dashboard</h3>
+          <p>Summary counters plus <strong>live trend charts</strong> (mempool visibility, connected workers, stored rows and tracked addresses) built from browser polling while you keep the dashboard open.</p>
+          <h3>Start / Stop</h3>
+          <p><strong>Start</strong> writes <span class="mono">memetracker_config.json</span> and launches workers. <strong>Stop</strong> signals workers to exit between connections (an active peer session may take a short while). A complete config file on disk can auto-start P2P when the process launches.</p>
+          <h3>Configuration</h3>
+          <p>Adjusts retention and per-address tx cap in <span class="mono">settings.json</span> without restarting P2P.</p>
+          <h3>Track address</h3>
+          <p>Same as <span class="mono">GET|POST /track/{address}</span>. Keeps the address watched and bumps retention.</p>
+          <h3>Tracked addresses / Transactions</h3>
+          <p>On-disk mirror of what you are watching and what was detected. Removing an address deletes its file and tx history in the app.</p>
+          <h3>API access</h3>
+          <p>Optional IP allowlist for JSON/track endpoints (see section above).</p>
+        </div>
+        <div class="card help-block">
+          <h2>HTTP API reference</h2>
+          <p>Replace <code>BASE</code> with your server origin, e.g. <span class="mono">http://127.0.0.1:33555</span>.</p>
+          <h3>Status &amp; health</h3>
+          <pre><code>curl -s BASE/api/status
+curl -s BASE/healthz</code></pre>
+          <h3>Start / Stop P2P</h3>
+          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1}"
+
+curl -s -X POST BASE/api/stop</code></pre>
+          <h3>Runtime limits</h3>
+          <pre><code>curl -s -X POST BASE/api/config -H "Content-Type: application/json" -d "{\"list_limit\":20,\"retention_days\":14}"</code></pre>
+          <h3>API allowlist</h3>
+          <pre><code>curl -s -X POST BASE/api/allowlist -H "Content-Type: application/json" -d "{\"api_allowed_ips\":[\"127.0.0.1\",\"10.0.0.0/24\"]}"</code></pre>
+          <h3>Track address</h3>
+          <pre><code>curl -s "BASE/track/YourP2PKHAddress"</code></pre>
+          <h3>Remove address / tx row</h3>
+          <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
+curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
+          <p class="muted">All API responses are JSON unless noted. Errors include an <span class="mono">error</span> string. A complete <span class="mono">memetracker_config.json</span> shape is required for <span class="mono">/api/start</span>; you may include <span class="mono">api_allowed_ips</span> as an array of strings.</p>
+        </div>
+      </section>
+
+      <footer style="margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border);font-size:.88rem;color:var(--accent-dim);text-align:center;line-height:1.5">
+        Coded with love to all Dogecoin Community
+      </footer>
+    </main>
+  </div>
+
+  <div id="modal-root" class="modal-root hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card">
+      <h3 id="modal-title">Confirm</h3>
+      <p id="modal-body" class="modal-body muted"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-with-icon" id="modal-cancel"><span class="material-icons" aria-hidden="true">close</span><span>Cancel</span></button>
+        <button type="button" class="btn btn-danger btn-with-icon" id="modal-confirm"><span class="material-icons" aria-hidden="true">check</span><span>Confirm</span></button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+(function(){
+  if (typeof Chart !== "undefined" && Chart.defaults) {
+    Chart.defaults.font.family = '"Comic Neue", "Comic Sans MS", cursive, system-ui, sans-serif';
+    Chart.defaults.color = "#8b9cb8";
+  }
+  const $ = (s) => document.querySelector(s);
+  const flash = $("#flash");
+  function showFlash(text, ok) {
+    flash.innerHTML = '<div class="msg '+(ok?'ok':'err')+'">'+escapeHtml(text)+'</div>';
+    setTimeout(function() { flash.innerHTML = ''; }, 6500);
+  }
+  function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+  function parseIPList(text) {
+    return text.split(/[\n,]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+  }
+  function sochainTxURL(txid) {
+    return "https://sochain.com/tx/DOGE/" + encodeURIComponent(txid);
+  }
+  document.getElementById("api-base").textContent = window.location.origin;
+
+  const sidebar = $("#sidebar");
+  const backdrop = $("#nav-backdrop");
+  function openNav() {
+    sidebar.classList.add("open");
+    backdrop.classList.add("visible");
+    $("#nav-open").setAttribute("aria-expanded", "true");
+  }
+  function closeNav() {
+    sidebar.classList.remove("open");
+    backdrop.classList.remove("visible");
+    $("#nav-open").setAttribute("aria-expanded", "false");
+  }
+  $("#nav-open").addEventListener("click", openNav);
+  $("#sidebar-close").addEventListener("click", closeNav);
+  backdrop.addEventListener("click", closeNav);
+  window.addEventListener("keydown", function(e) {
+    if (e.key === "Escape") closeNav();
+  });
+
+  var RAIL_KEY = "mtrSidebarRail";
+  function syncSidebarRailIcon() {
+    var icon = $("#nav-sidebar-toggle-icon");
+    if (!icon) return;
+    icon.textContent = document.body.classList.contains("sidebar-rail") ? "chevron_right" : "chevron_left";
+  }
+  function applySidebarRailFromStorage() {
+    if (!window.matchMedia("(min-width: 880px)").matches) {
+      document.body.classList.remove("sidebar-rail");
+      syncSidebarRailIcon();
+      return;
+    }
+    if (localStorage.getItem(RAIL_KEY) === "1") document.body.classList.add("sidebar-rail");
+    else document.body.classList.remove("sidebar-rail");
+    syncSidebarRailIcon();
+  }
+  var navSidebarToggle = $("#nav-sidebar-toggle");
+  if (navSidebarToggle) {
+    navSidebarToggle.addEventListener("click", function() {
+      if (!window.matchMedia("(min-width: 880px)").matches) return;
+      document.body.classList.toggle("sidebar-rail");
+      localStorage.setItem(RAIL_KEY, document.body.classList.contains("sidebar-rail") ? "1" : "0");
+      syncSidebarRailIcon();
+    });
+  }
+  applySidebarRailFromStorage();
+  window.addEventListener("resize", applySidebarRailFromStorage);
+
+  function showPanel(tab) {
+    document.querySelectorAll(".side-nav button").forEach(function(b) {
+      b.classList.toggle("active", b.getAttribute("data-tab") === tab);
+    });
+    document.querySelectorAll("section.panel").forEach(function(p) {
+      p.classList.toggle("active", p.id === "panel-" + tab);
+    });
+    if (window.matchMedia("(max-width: 879px)").matches) closeNav();
+  }
+  document.querySelectorAll(".side-nav button").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      showPanel(btn.getAttribute("data-tab"));
+    });
+  });
+
+  function confirmModal(opts) {
+    return new Promise(function(resolve) {
+      const root = $("#modal-root");
+      const titleEl = $("#modal-title");
+      const bodyEl = $("#modal-body");
+      const btnOk = $("#modal-confirm");
+      const btnCancel = $("#modal-cancel");
+      titleEl.textContent = opts.title || "Confirm";
+      bodyEl.textContent = opts.body || "";
+      var confirmLabel = escapeHtml(opts.confirmText || "Confirm");
+      btnOk.innerHTML = '<span class="material-icons" aria-hidden="true">check</span><span>' + confirmLabel + "</span>";
+      btnOk.className = "btn btn-with-icon " + (opts.danger ? "btn-danger" : "btn-primary");
+      root.classList.remove("hidden");
+      function finish(v) {
+        root.classList.add("hidden");
+        btnCancel.removeEventListener("click", onCancel);
+        btnOk.removeEventListener("click", onOk);
+        root.removeEventListener("click", onBackdrop);
+        resolve(v);
+      }
+      function onCancel() { finish(false); }
+      function onOk() { finish(true); }
+      function onBackdrop(ev) { if (ev.target === root) onCancel(); }
+      btnCancel.addEventListener("click", onCancel);
+      btnOk.addEventListener("click", onOk);
+      root.addEventListener("click", onBackdrop);
+    });
+  }
+
+  async function api(path, opts) {
+    const r = await fetch(path, Object.assign({ headers: { "Accept": "application/json" } }, opts || {}));
+    const t = await r.text();
+    let j = null;
+    try { j = JSON.parse(t); } catch (_) {}
+    if (!r.ok) throw new Error((j && j.error) || t || r.statusText);
+    return j;
+  }
+
+  var HIST_MAX = 90;
+  var hist = { t: [], mempool: [], peers: [], stored: [], addrs: [] };
+  var dashCharts = { mempool: null, peers: null, store: null };
+
+  function chartTheme() {
+    return {
+      accent: "rgba(242, 169, 0, 0.95)",
+      accentFill: "rgba(242, 169, 0, 0.14)",
+      ok: "rgba(93, 190, 138, 0.9)",
+      okFill: "rgba(93, 190, 138, 0.12)",
+      cyan: "rgba(100, 181, 246, 0.9)",
+      tick: "#8b9cb8",
+      grid: "rgba(255,255,255,0.07)"
+    };
+  }
+
+  function baseChartOpts(T) {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { labels: { color: T.tick, boxWidth: 11, font: { size: 11 } } },
+        tooltip: {
+          titleColor: "#e8edf5",
+          bodyColor: "#e8edf5",
+          backgroundColor: "rgba(21,29,44,.95)",
+          borderColor: "rgba(255,255,255,.12)",
+          borderWidth: 1
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: T.tick, maxRotation: 0, autoSkip: true, maxTicksLimit: 7 },
+          grid: { color: T.grid }
+        },
+        y: {
+          ticks: { color: T.tick },
+          grid: { color: T.grid },
+          beginAtZero: true
+        }
+      }
+    };
+  }
+
+  function ensureDashCharts() {
+    if (typeof Chart === "undefined") return;
+    var T = chartTheme();
+    if ($("#chart-mempool") && !dashCharts.mempool) {
+      dashCharts.mempool = new Chart($("#chart-mempool"), {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [{
+            label: "Mempool",
+            data: [],
+            borderColor: T.accent,
+            backgroundColor: T.accentFill,
+            fill: true,
+            tension: 0.25,
+            pointRadius: 0,
+            borderWidth: 2
+          }]
+        },
+        options: baseChartOpts(T)
+      });
+    }
+    if ($("#chart-peers") && !dashCharts.peers) {
+      var po = baseChartOpts(T);
+      po.scales.y.ticks.stepSize = 1;
+      dashCharts.peers = new Chart($("#chart-peers"), {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [{
+            label: "Connected workers",
+            data: [],
+            borderColor: T.ok,
+            backgroundColor: T.okFill,
+            fill: true,
+            tension: 0.25,
+            pointRadius: 0,
+            borderWidth: 2
+          }]
+        },
+        options: po
+      });
+    }
+    if ($("#chart-store") && !dashCharts.store) {
+      dashCharts.store = new Chart($("#chart-store"), {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: "Stored tx rows",
+              data: [],
+              borderColor: T.accent,
+              backgroundColor: "transparent",
+              tension: 0.25,
+              pointRadius: 0,
+              borderWidth: 2
+            },
+            {
+              label: "Tracked addresses",
+              data: [],
+              borderColor: T.cyan,
+              backgroundColor: "transparent",
+              tension: 0.25,
+              pointRadius: 0,
+              borderWidth: 2
+            }
+          ]
+        },
+        options: baseChartOpts(T)
+      });
+    }
+  }
+
+  function recordHistory(st) {
+    var lbl = new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    hist.t.push(lbl);
+    hist.mempool.push(Number(st.mempool_tx_count) || 0);
+    hist.peers.push(Number(st.peers_connected_count) || 0);
+    hist.stored.push(Number(st.stored_transaction_rows) || 0);
+    hist.addrs.push(Number(st.watched_addresses) || 0);
+    while (hist.t.length > HIST_MAX) {
+      hist.t.shift();
+      hist.mempool.shift();
+      hist.peers.shift();
+      hist.stored.shift();
+      hist.addrs.shift();
+    }
+  }
+
+  function updateDashCharts() {
+    if (typeof Chart === "undefined") return;
+    ensureDashCharts();
+    if (!dashCharts.mempool || !dashCharts.peers || !dashCharts.store) return;
+    dashCharts.mempool.data.labels = hist.t.slice();
+    dashCharts.mempool.data.datasets[0].data = hist.mempool.slice();
+    dashCharts.mempool.update("none");
+    dashCharts.peers.data.labels = hist.t.slice();
+    dashCharts.peers.data.datasets[0].data = hist.peers.slice();
+    dashCharts.peers.update("none");
+    dashCharts.store.data.labels = hist.t.slice();
+    dashCharts.store.data.datasets[0].data = hist.stored.slice();
+    dashCharts.store.data.datasets[1].data = hist.addrs.slice();
+    dashCharts.store.update("none");
+  }
+
+  function fillStartForm(fc) {
+    if (!fc) return;
+    const f = $("#form-start");
+    f.http_port.value = fc.http_port;
+    f.http_bind.value = fc.http_bind || "";
+    f.network.value = fc.network || "mainnet";
+    f.storage_dir.value = fc.storage_dir || "";
+    f.list_limit.value = fc.list_limit;
+    f.retention_days.value = fc.retention_days;
+    f.p2p_host.value = fc.p2p_host || "";
+    f.p2p_port.value = fc.p2p_port;
+    f.p2p_parallel.value = fc.p2p_parallel;
+    f.p2p_log.value = fc.p2p_log;
+    var ips = fc.api_allowed_ips;
+    f.api_allowed_ips_text.value = Array.isArray(ips) && ips.length ? ips.join("\n") : "";
+  }
+
+  async function refreshAll() {
+    try {
+      const st = await api("/api/status");
+      var run = !!st.p2p_running;
+      $("#wizard-banner").classList.toggle("hidden", run);
+      $("#running-banner").classList.toggle("hidden", !run);
+      if (st.memetracker_config_path) $("#cfg-path-hint").textContent = st.memetracker_config_path;
+      fillStartForm(st.full_config);
+      var allow = (st.full_config && st.full_config.api_allowed_ips) || [];
+      $("#allowlist-text").value = Array.isArray(allow) && allow.length ? allow.join("\n") : "";
+
+      $("#dash-updated").textContent = "Updated " + new Date().toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
+      var dash = $("#dash-stats");
+      dash.innerHTML = "";
+      var statRows = [
+        { k: "P2P running", v: run ? "yes" : "no", hint: run ? "Workers rotate peers between sessions." : "Start from the banner or use a complete memetracker_config.json." },
+        { k: "Tracked addresses", v: st.watched_addresses },
+        { k: "Stored tx rows", v: st.stored_transaction_rows },
+        { k: "Mempool (unique tx ids)", v: st.mempool_tx_count, hint: run ? "Relay visibility on current peer sessions." : "Starts counting when P2P is running." },
+        { k: "P2P workers connected", v: st.peers_connected_count, hint: run ? "Sessions with an open peer right now." : "—" }
+      ];
+      statRows.forEach(function(row) {
+        var d = document.createElement("div");
+        d.className = "stat";
+        var hint = row.hint && row.hint !== "—" ? '<div class="stat-rownote">' + escapeHtml(row.hint) + "</div>" : "";
+        d.innerHTML = '<div class="statVAL">' + escapeHtml(String(row.v)) + '</div><div class="statLBL">' + escapeHtml(row.k) + "</div>" + hint;
+        dash.appendChild(d);
+      });
+
+      recordHistory(st);
+      updateDashCharts();
+
+      $("#cfg-readonly").textContent = JSON.stringify(st.config, null, 2);
+
+      var cfg = await api("/api/config");
+      var form = $("#form-cfg");
+      form.list_limit.value = cfg.list_limit;
+      form.retention_days.value = cfg.retention_days;
+
+      var tbody = $("#tbody-addr");
+      tbody.innerHTML = "";
+      (st.addresses || []).forEach(function(a) {
+        var tr = document.createElement("tr");
+        tr.innerHTML = '<td data-label="Address" class="mono">' + escapeHtml(a.address) + '</td>' +
+          '<td data-label="Hash160" class="mono">' + escapeHtml(a.hash160_hex) + '</td>' +
+          '<td data-label="Tracked since">' + escapeHtml(a.tracked_since) + '</td>' +
+          '<td data-label="Last refresh">' + escapeHtml(a.last_requested) + '</td>' +
+          '<td data-label="Tx count">' + escapeHtml(String(a.tx_count)) + '</td>' +
+          '<td data-label="" class="row-actions"><button type="button" class="btn btn-danger btn-sm btn-with-icon" data-rm-addr="' + escapeHtml(a.hash160_hex) + '"><span class="material-icons" aria-hidden="true">delete_outline</span><span>Remove</span></button></td>';
+        tbody.appendChild(tr);
+      });
+
+      var tbx = $("#tbody-tx");
+      tbx.innerHTML = "";
+      (st.transactions || []).forEach(function(tx) {
+        var tr = document.createElement("tr");
+        var txidEsc = escapeHtml(tx.txid);
+        var explore = sochainTxURL(tx.txid);
+        tr.innerHTML = '<td data-label="Time">' + escapeHtml(tx.datetime) + '</td>' +
+          '<td data-label="Address" class="mono">' + escapeHtml(tx.address) + '</td>' +
+          '<td data-label="Txid" class="mono txid-cell"><span class="txid-line">' + txidEsc +
+          '<button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(tx.txid) + '" title="Copy txid" aria-label="Copy txid"><span class="material-icons" aria-hidden="true">content_copy</span></button></span></td>' +
+          '<td data-label="DOGE">' + escapeHtml(Number(tx.amount_doge).toFixed(8)) + '</td>' +
+          '<td data-label="Explorer / remove" class="row-actions"><div class="tx-links">' +
+          '<a class="btn btn-sm btn-with-icon" href="' + explore + '" target="_blank" rel="noopener noreferrer"><span class="material-icons" aria-hidden="true">open_in_new</span><span>sochain</span></a>' +
+          '<button type="button" class="btn btn-danger btn-sm btn-with-icon" data-rm-tx="' + encodeURIComponent(tx.hash160_hex) + '" data-txid="' + escapeHtml(tx.txid) + '"><span class="material-icons" aria-hidden="true">delete_outline</span><span>Remove</span></button>' +
+          '</div></td>';
+        tbx.appendChild(tr);
+      });
+
+      var ps = $("#peer-stats");
+      ps.innerHTML = "";
+      [["Mempool unique tx", st.mempool_tx_count]].forEach(function(row) {
+        var d = document.createElement("div");
+        d.className = "stat";
+        d.innerHTML = '<div class="statVAL">' + escapeHtml(String(row[1])) + '</div><div class="statLBL">' + escapeHtml(row[0]) + '</div>';
+        ps.appendChild(d);
+      });
+
+      var tp = $("#tbody-peers");
+      tp.innerHTML = "";
+      (st.peers || []).forEach(function(p) {
+        var tr = document.createElement("tr");
+        var pill = p.connected ? '<span class="pill">connected</span>' : '<span class="pill off">idle</span>';
+        tr.innerHTML = '<td data-label="Worker">' + escapeHtml(String(p.worker_id)) + '</td>' +
+          '<td data-label="Peer" class="mono">' + escapeHtml(p.address || "—") + '</td>' +
+          '<td data-label="Status">' + pill + '</td>' +
+          '<td data-label="Updated">' + escapeHtml(p.updated) + '</td>';
+        tp.appendChild(tr);
+      });
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  document.body.addEventListener("click", async function(ev) {
+    var copyB = ev.target.closest("[data-copy-tx]");
+    if (copyB) {
+      var txid = copyB.getAttribute("data-copy-tx");
+      try {
+        await navigator.clipboard.writeText(txid);
+        showFlash("Txid copied to clipboard.", true);
+      } catch (_) {
+        showFlash("Could not copy (clipboard permission).", false);
+      }
+      return;
+    }
+    var b = ev.target.closest("[data-rm-addr]");
+    if (b) {
+      var id = b.getAttribute("data-rm-addr");
+      var ok = await confirmModal({
+        title: "Remove tracked address",
+        body: "Remove this address and all stored transactions for it from MemeTracker? This cannot be undone.",
+        confirmText: "Remove",
+        danger: true
+      });
+      if (!ok) return;
+      try {
+        await api("/api/addresses/" + id, { method: "DELETE" });
+        showFlash("Address removed.", true);
+        refreshAll();
+      } catch (e) { showFlash(e.message, false); }
+      return;
+    }
+    var t = ev.target.closest("[data-rm-tx]");
+    if (t) {
+      var hash = decodeURIComponent(t.getAttribute("data-rm-tx"));
+      var txid = t.getAttribute("data-txid");
+      var ok2 = await confirmModal({
+        title: "Remove transaction row",
+        body: "Remove this row from the store only (not from the blockchain)?",
+        confirmText: "Remove",
+        danger: true
+      });
+      if (!ok2) return;
+      try {
+        await api("/api/transactions?hash160_hex=" + encodeURIComponent(hash) + "&txid=" + encodeURIComponent(txid), { method: "DELETE" });
+        showFlash("Transaction removed.", true);
+        refreshAll();
+      } catch (e) { showFlash(e.message, false); }
+    }
+  });
+
+  $("#form-start").addEventListener("submit", async function(ev) {
+    ev.preventDefault();
+    var f = ev.target;
+    var body = {
+      http_port: parseInt(f.http_port.value, 10),
+      http_bind: f.http_bind.value.trim(),
+      network: f.network.value,
+      storage_dir: f.storage_dir.value.trim(),
+      list_limit: parseInt(f.list_limit.value, 10),
+      retention_days: parseInt(f.retention_days.value, 10),
+      p2p_host: f.p2p_host.value.trim(),
+      p2p_port: parseInt(f.p2p_port.value, 10),
+      p2p_parallel: parseInt(f.p2p_parallel.value, 10),
+      p2p_log: parseInt(f.p2p_log.value, 10),
+      api_allowed_ips: parseIPList(f.api_allowed_ips_text.value || "")
+    };
+    try {
+      var r = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify(body) });
+      var t = await r.text();
+      var j = null;
+      try { j = JSON.parse(t); } catch (_) {}
+      if (!r.ok) throw new Error((j && j.error) || t);
+      if (j && j.restart_required) {
+        showFlash((j.message || "Restart MemeTracker to apply storage path.") + " Then click Start again if needed.", true);
+      } else {
+        showFlash("MemeTracker P2P watcher started.", true);
+      }
+      refreshAll();
+    } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#btn-stop").addEventListener("click", async function() {
+    var ok = await confirmModal({
+      title: "Stop P2P watcher",
+      body: "Stop mempool monitoring? Workers will disconnect between peer sessions (active sessions may take a short while). The web UI stays online. You can click Start again, or if memetracker_config.json is complete the next full app restart will auto-start P2P.",
+      confirmText: "Stop P2P",
+      danger: true
+    });
+    if (!ok) return;
+    try {
+      await api("/api/stop", { method: "POST" });
+      showFlash("P2P watcher stopped.", true);
+      refreshAll();
+    } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#btn-track").addEventListener("click", async function() {
+    var addr = $("#track-addr").value.trim();
+    if (!addr) return;
+    try {
+      await api("/track/" + encodeURI(addr), { method: "POST" });
+      showFlash("Now tracking " + addr, true);
+      $("#track-addr").value = "";
+      refreshAll();
+    } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#form-cfg").addEventListener("submit", async function(ev) {
+    ev.preventDefault();
+    var fd = new FormData(ev.target);
+    try {
+      await api("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          list_limit: parseInt(fd.get("list_limit"), 10),
+          retention_days: parseInt(fd.get("retention_days"), 10)
+        })
+      });
+      showFlash("Settings saved.", true);
+      refreshAll();
+    } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#form-allowlist").addEventListener("submit", async function(ev) {
+    ev.preventDefault();
+    var ips = parseIPList($("#allowlist-text").value || "");
+    try {
+      await api("/api/allowlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_allowed_ips: ips })
+      });
+      showFlash("API allowlist saved to memetracker_config.json.", true);
+      refreshAll();
+    } catch (e) { showFlash(e.message, false); }
+  });
+
+  setInterval(refreshAll, 4000);
+  refreshAll();
+})();
+  </script>
+</body>
+</html>
