@@ -268,6 +268,7 @@
     .msg.err { background: rgba(232,93,93,.12); border: 1px solid rgba(232,93,93,.35); }
     .pill { display: inline-block; font-size: .68rem; font-weight: 600; padding: .15rem .4rem; border-radius: 999px; background: rgba(93,190,138,.2); color: var(--ok); }
     .pill.off { background: rgba(139,156,184,.2); color: var(--muted); }
+    .pill.warn { background: rgba(232,93,93,.2); color: var(--danger); }
     .banner-start {
       background: linear-gradient(135deg, rgba(242,169,0,.18), rgba(28,38,56,.9));
       border: 1px solid rgba(242,169,0,.35); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 1rem;
@@ -541,6 +542,8 @@
           <p>Same as <span class="mono">GET|POST /track/{address}</span>. Keeps the address watched and bumps retention.</p>
           <h3>Tracked addresses / Transactions</h3>
           <p>On-disk mirror of what you are watching and what was detected. Removing an address deletes its file and tx history in the app.</p>
+          <h3>Double-spend detection (mempool)</h3>
+          <p>MemeTracker also checks transaction <strong>inputs</strong> while watching live mempool traffic. If two or more mempool transactions spend the same previous output (same <span class="mono">prev_txid:vout</span>), they are flagged as a conflict and shown with a red <strong>Double spent detected</strong> badge. This check is live-window only: once transactions disappear from the current mempool tracking window, they are no longer actively compared. The feature is intended for transactions related to watched payment addresses.</p>
           <h3>API access</h3>
           <p>Optional IP allowlist for JSON/track endpoints (see section above).</p>
         </div>
@@ -560,6 +563,8 @@ curl -s -X POST BASE/api/stop</code></pre>
           <pre><code>curl -s -X POST BASE/api/allowlist -H "Content-Type: application/json" -d "{\"api_allowed_ips\":[\"127.0.0.1\",\"10.0.0.0/24\"]}"</code></pre>
           <h3>Track address</h3>
           <pre><code>curl -s "BASE/track/YourP2PKHAddress"</code></pre>
+          <h3>Double-spend flag in API data</h3>
+          <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span> (<span class="mono">true</span>/<span class="mono">false</span>) so automation can detect conflicting mempool spends.</p>
           <h3>Remove address / tx row</h3>
           <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
 curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
@@ -935,11 +940,12 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         var tr = document.createElement("tr");
         var txidEsc = escapeHtml(tx.txid);
         var explore = sochainTxURL(tx.txid);
+        var dsBadge = tx.double_spent ? ' <span class="pill warn">Double spent detected</span>' : "";
         tr.innerHTML = '<td data-label="Time">' + escapeHtml(tx.datetime) + '</td>' +
           '<td data-label="Address" class="mono">' + escapeHtml(tx.address) + '</td>' +
           '<td data-label="Txid" class="mono txid-cell"><span class="txid-line">' + txidEsc +
           '<button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(tx.txid) + '" title="Copy txid" aria-label="Copy txid"><span class="material-icons" aria-hidden="true">content_copy</span></button></span></td>' +
-          '<td data-label="DOGE">' + escapeHtml(Number(tx.amount_doge).toFixed(8)) + '</td>' +
+          '<td data-label="DOGE">' + escapeHtml(Number(tx.amount_doge).toFixed(8)) + dsBadge + '</td>' +
           '<td data-label="Explorer / remove" class="row-actions"><div class="tx-links">' +
           '<a class="btn btn-sm btn-with-icon" href="' + explore + '" target="_blank" rel="noopener noreferrer"><span class="material-icons" aria-hidden="true">open_in_new</span><span>sochain</span></a>' +
           '<button type="button" class="btn btn-danger btn-sm btn-with-icon" data-rm-tx="' + encodeURIComponent(tx.hash160_hex) + '" data-txid="' + escapeHtml(tx.txid) + '"><span class="material-icons" aria-hidden="true">delete_outline</span><span>Remove</span></button>' +
