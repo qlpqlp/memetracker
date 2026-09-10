@@ -4,12 +4,12 @@
 
 MemeTracker allows you to detect payments in ~3 seconds so you can use it in your business to accept Dogecoin payments, detect them quickly, and confirm later while your customer sits down and enjoys their coffee.
 
-MemeTracker is a **Dogecoin mempool watcher**: it connects to the public P2P network (or your own node), requests the mempool, and follows `inv` / `getdata` / `tx` traffic. It also keeps a rolling **~24 hour header window** and scans new **block bodies** as a safeguard when a payment reaches a miner without being seen first in the mempool view. When a transaction pays one of your tracked **P2PKH** addresses (classic base58, e.g. mainnet addresses starting with `D`), it records the txid, timestamp, DOGE amount, and double-spend flag, and can call an optional HTTP callback.
+MemeTracker is a **Dogecoin mempool watcher**: it connects to the public P2P network (or your own node), requests the mempool, and follows `inv` / `getdata` / `tx` traffic. **Mempool is always first priority.** Headers/tip-block scans are only a backup when a payment skips mempool relay and is mined immediately. When a transaction pays one of your tracked **P2PKH** addresses (classic base58, e.g. mainnet addresses starting with `D`), it records the txid, timestamp, DOGE amount, and double-spend flag, and can call an optional HTTP callback.
 
 ## How it works
 
-1. **P2P (mempool)** - Several parallel sessions (default 3, configurable) connect to DNS seeds or `P2P_HOST`, complete version handshake, send `mempool`, then handle `inv` (transaction inventory), request bodies with `getdata`, and parse `tx` payloads.
-2. **P2P (header safeguard)** - After handshake the app also sends `sendheaders`, requests `getheaders`, and fetches `block` bodies for new tip hashes. Headers are kept for about **24 hours** (pruned by timestamp). Parent blocks within that window can be walked back on connect so recent history is covered. Non-coinbase txs in those blocks are matched against watched addresses the same way as mempool txs (`AddTx` dedupes by txid).
+1. **P2P (mempool, priority 1)** - Several parallel sessions (default 3, configurable) connect to DNS seeds or `P2P_HOST`, complete version handshake, send `mempool`, then handle `inv` (transaction inventory), request bodies with `getdata`, and parse `tx` payloads. This path must not be starved.
+2. **P2P (header backup, priority 2)** - Tracks tip headers (`sendheaders` / `getheaders`), persists tip to `{storage}/header_tip.json`, and only scans **recent tip block bodies** when mempool is quiet. Purpose: catch watched payments that missed mempool relay and were mined immediately. Not a full historical block download.
 3. **Parsing** - Outputs are scanned for P2PKH / P2SH / v0 P2WPKH patterns; amounts going to a watched **hash160** are summed per transaction.
 4. **Double-spend detection** - Inputs are tracked by outpoint (`prev_txid:vout`) during live mempool observation. If multiple txids spend the same outpoint in the active tracking window, those tx rows are marked as `double_spent = true`. Block-scan hits do not invent mempool conflicts.
 5. **Storage** - Each watched address has a JSON file under `{storage}/addresses/{hash160}.json`. Transactions are capped per address (`list_limit`) and addresses expire after `retention_days` without a refresh via `GET/POST /track/<address>`.
@@ -104,7 +104,7 @@ If `MTR_STORAGE_DIR` is unset:
 ## Web interface
 
 - **Start MemeTracker** - Shown while P2P is off: full-parameter form and **Start** (writes `memetracker_config.json`). Hidden when P2P is running or after a complete config auto-starts the watcher.
-- **Dashboard** - Counts: P2P on/off, tracked addresses, stored tx rows, mempool ids seen, connected workers, plus header safeguard tip / headers kept / blocks scanned / confirmed-from-block hits.
+- **Dashboard** - Counts: P2P on/off, tracked addresses, stored tx rows, mempool ids seen, connected workers, plus header tip height/hash (copyable), headers kept, blocks scanned, and confirmed-from-block hits.
 - **Configuration** - Edit stored tx cap and retention; view effective env-derived options (network, bind, P2P).
 - **Track address** - Add a P2PKH address (same as `/track/<address>`).
 - **Tracked addresses** - Table with **tracked since** and **last refresh** timestamps; **Remove** deletes the address and **all** stored txs for it.
@@ -121,7 +121,7 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 | ------ | ---- | ----------- |
 | GET | `/` | Web dashboard |
 | GET | `/healthz` | Health JSON |
-| GET | `/api/status` | Full dashboard payload; includes `p2p_running`, `full_config`, `memetracker_config_path`, `transactions[].double_spent`, and `header_safeguard` |
+| GET | `/api/mempool?offset=&limit=` | Paginated newest-first mempool txids (`limit` max 100). Prefer this over dumping thousands into `/api/status`. |
 | POST | `/api/start` | Body: full `memetracker_config.json` shape; saves file and starts P2P (or returns `restart_required` if `storage_dir` changed) |
 | POST | `/api/stop` | Stop P2P workers and the Dogebox metrics ticker; HTTP UI keeps running. **Note:** if a complete `memetracker_config.json` exists, the next process restart will auto-start P2P again unless you remove that file or set `MTR_NO_AUTOSTART=1`. |
 | POST | `/api/allowlist` | JSON `{ "api_allowed_ips": ["127.0.0.1"], "api_token": "secret" }`. Empty IP array => allow all IPs when no token prefix is used. Empty `api_token` clears the token. Writes `memetracker_config.json`. |
@@ -141,10 +141,14 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 - `datetime`
 - `hash160_hex`
 - `double_spent` (`true` when a conflicting spend was detected in the current live mempool tracking window)
+- `confirmed` (`true` once the payment was seen in a scanned block)
+- `confirmations` (integer 0-5: header/block depth after inclusion; stays at 5 once deeper)
+- `block_height` (inclusion height when known)
 
 `/api/status` also includes `header_safeguard`:
 
 - `tip_hash`
+- `tip_height` (number when known, otherwise null)
 - `tip_time_utc`
 - `headers_kept`
 - `headers_seen_total`
@@ -152,6 +156,8 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 - `confirmed_hits` (watched payments newly stored from block scans)
 - `pending_block_fetches`
 - `retention` (e.g. `24h0m0s`)
+- `persist_path` (usually `{storage}/header_tip.json`)
+- `resumed_from_disk`
 
 Verify checksums after download:
 

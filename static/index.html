@@ -219,6 +219,7 @@
     .statVAL { font-size: 1.25rem; font-weight: 700; color: var(--accent); }
     .statLBL { font-size: .8rem; color: var(--muted); }
     .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -.25rem; padding: 0 .25rem; }
+    .mempool-list-wrap { max-height: 22rem; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
     table.responsive { width: 100%; border-collapse: collapse; font-size: .85rem; min-width: 520px; }
     .responsive th, .responsive td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(--border); vertical-align: top; }
     .responsive th { color: var(--muted); font-weight: 600; font-size: .7rem; text-transform: uppercase; letter-spacing: .04em; }
@@ -320,6 +321,8 @@
       margin: 0 0 .35rem .35rem;
     }
     .txid-line { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .4rem; max-width: 100%; vertical-align: middle; }
+    .tip-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+    .tip-row .statVAL { font-size: 1.35rem; }
     .copy-tx-badge {
       display: inline-flex;
       align-items: center;
@@ -352,7 +355,6 @@
     <nav class="side-nav">
       <button type="button" class="active" data-tab="dash"><span class="material-icons side-nav-ico" aria-hidden="true">dashboard</span><span class="side-nav-label">Dashboard</span></button>
       <button type="button" data-tab="cfg"><span class="material-icons side-nav-ico" aria-hidden="true">tune</span><span class="side-nav-label">Configuration</span></button>
-      <button type="button" data-tab="add"><span class="material-icons side-nav-ico" aria-hidden="true">add_circle</span><span class="side-nav-label">Track address</span></button>
       <button type="button" data-tab="addr"><span class="material-icons side-nav-ico" aria-hidden="true">account_balance_wallet</span><span class="side-nav-label">Tracked addresses</span></button>
       <button type="button" data-tab="tx"><span class="material-icons side-nav-ico" aria-hidden="true">receipt_long</span><span class="side-nav-label">Transactions</span></button>
       <button type="button" data-tab="peers"><span class="material-icons side-nav-ico" aria-hidden="true">device_hub</span><span class="side-nav-label">Peers &amp; mempool</span></button>
@@ -429,6 +431,24 @@
           </div>
           <div class="grid2" id="dash-stats"></div>
         </div>
+        <div class="card" id="tip-card">
+          <h2>Header tip</h2>
+          <p class="muted" style="margin:.25rem 0 .75rem">Backup tip for resume after restart. Mempool watching stays first; tip-block scans only run when mempool is quiet.</p>
+          <div class="tip-row">
+            <div>
+              <div class="statLBL">Block height</div>
+              <div class="statVAL" id="tip-height">n/a</div>
+            </div>
+            <div style="min-width:0;flex:1">
+              <div class="statLBL">Tip hash</div>
+              <div class="txid-line mono" style="margin-top:.35rem;word-break:break-all">
+                <span id="tip-hash">n/a</span>
+                <button type="button" class="copy-tx-badge hidden" id="tip-copy" data-copy-tx="" title="Copy tip hash" aria-label="Copy tip hash"><span class="material-icons" aria-hidden="true">content_copy</span></button>
+              </div>
+              <div class="stat-rownote" id="tip-meta"></div>
+            </div>
+          </div>
+        </div>
         <div class="card">
           <h2>Live trends</h2>
           <p class="muted" style="margin-top:.25rem">Charts accumulate samples from this tab while it is open (~every 4 seconds). Reload clears history.</p>
@@ -444,6 +464,34 @@
             <div class="chart-box">
               <div class="chart-title">MemeTracker · stored rows &amp; addresses</div>
               <canvas id="chart-store" aria-label="Stored data over time"></canvas>
+            </div>
+          </div>
+        </div>
+        <div class="card" id="mempool-list-card">
+          <h2>Mempool transactions</h2>
+          <p class="muted" style="margin:.25rem 0 .75rem">Newest wire inv ids. Dashboard shows the latest <strong>20</strong> (updates live). Total seen: <span id="mempool-list-count">0</span>. Matched payments stay under Transactions.</p>
+          <div id="mempool-recent-panel">
+            <div class="table-wrap mempool-list-wrap">
+              <table class="responsive" id="table-mempool">
+                <thead><tr><th>#</th><th>Txid</th></tr></thead>
+                <tbody id="tbody-mempool"></tbody>
+              </table>
+            </div>
+            <div style="margin-top:.75rem">
+              <button type="button" class="btn btn-with-icon" id="btn-mempool-see-all"><span class="material-icons" aria-hidden="true">unfold_more</span><span>See all</span></button>
+            </div>
+          </div>
+          <div id="mempool-all-panel" class="hidden">
+            <div class="table-wrap mempool-list-wrap" id="mempool-all-scroll">
+              <table class="responsive" id="table-mempool-all">
+                <thead><tr><th>#</th><th>Txid</th></tr></thead>
+                <tbody id="tbody-mempool-all"></tbody>
+              </table>
+              <div id="mempool-all-sentinel" class="muted" style="padding:.75rem;text-align:center">Scroll for more…</div>
+            </div>
+            <div style="margin-top:.75rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
+              <button type="button" class="btn btn-with-icon" id="btn-mempool-show-recent"><span class="material-icons" aria-hidden="true">unfold_less</span><span>Show latest 20</span></button>
+              <span class="muted" id="mempool-all-meta"></span>
             </div>
           </div>
         </div>
@@ -468,21 +516,14 @@
         </div>
       </section>
 
-      <section id="panel-add" class="panel">
-        <div class="card">
-          <h2>Track address</h2>
-          <p class="muted">Registers a <strong>P2PKH</strong> (legacy base58) address. Requires P2P running. Refreshes retention timer on each call.</p>
-          <div class="track-row">
-            <input id="track-addr" type="text" placeholder="Mainnet P2PKH address…"/>
-            <button type="button" class="btn btn-with-icon" id="btn-track"><span class="material-icons" aria-hidden="true">add_location_alt</span><span>Track</span></button>
-          </div>
-        </div>
-      </section>
-
       <section id="panel-addr" class="panel">
         <div class="card">
           <h2>Tracked addresses</h2>
-          <p class="muted">Persisted under your data directory. Remove clears the address file and all stored txs for it.</p>
+          <p class="muted">Add a <strong>P2PKH</strong> (legacy base58) address below. Requires P2P running. Each track refreshes retention. Remove clears the address file and all stored txs for it.</p>
+          <div class="track-row">
+            <input id="track-addr" type="text" placeholder="Mainnet P2PKH address…"/>
+            <button type="button" class="btn btn-primary btn-with-icon" id="btn-track"><span class="material-icons" aria-hidden="true">add_location_alt</span><span>Track address</span></button>
+          </div>
           <div class="table-wrap">
             <table class="responsive" id="table-addr">
               <thead><tr><th>Address</th><th>Hash160</th><th>Tracked since</th><th>Last refresh</th><th>Tx count</th><th></th></tr></thead>
@@ -495,10 +536,10 @@
       <section id="panel-tx" class="panel">
         <div class="card">
           <h2>Transactions</h2>
-          <p class="muted">Rows detected from mempool traffic paying your watched addresses. Use the copy badge after each txid, or open on sochain.</p>
+          <p class="muted">Matched payments to your watched addresses only (not the full mempool list on the Dashboard). Status shows unconfirmed or confirmed with depth 0-5. Use the copy badge after each txid, or open on sochain.</p>
           <div class="table-wrap">
             <table class="responsive" id="table-tx">
-              <thead><tr><th>Time (UTC)</th><th>Address</th><th>Txid</th><th>DOGE</th><th>Explorer / remove</th></tr></thead>
+              <thead><tr><th>Time (UTC)</th><th>Address</th><th>Txid</th><th>DOGE</th><th>Status</th><th>Explorer / remove</th></tr></thead>
               <tbody id="tbody-tx"></tbody>
             </table>
           </div>
@@ -508,12 +549,20 @@
       <section id="panel-peers" class="panel">
         <div class="card">
           <h2>Peers &amp; mempool</h2>
-          <p class="muted">Parallel workers each maintain one session at a time. Mempool count = unique tx ids recently seen on the wire.</p>
+          <p class="muted">Parallel workers each maintain one session at a time. Mempool count = unique inv tx ids seen on the wire. The list below is the latest raw <span class="mono">tx</span> bodies downloaded for matching (not every mempool id).</p>
           <div class="grid2" id="peer-stats"></div>
           <div class="table-wrap" style="margin-top:1rem">
             <table class="responsive" id="table-peers">
               <thead><tr><th>Worker</th><th>Peer</th><th>Status</th><th>Updated</th></tr></thead>
               <tbody id="tbody-peers"></tbody>
+            </table>
+          </div>
+          <h3 style="margin:1.25rem 0 .5rem;font-size:1rem">Recent tx bodies received</h3>
+          <p class="muted" style="margin:0 0 .5rem">Newest last. Confirms getdata is delivering bodies (used to match watched addresses).</p>
+          <div class="table-wrap">
+            <table class="responsive" id="table-recent-tx">
+              <thead><tr><th>#</th><th>Txid</th></tr></thead>
+              <tbody id="tbody-recent-tx"></tbody>
             </table>
           </div>
         </div>
@@ -538,19 +587,19 @@
       <section id="panel-help" class="panel">
         <div class="card help-block">
           <h2>How MemeTracker works</h2>
-          <p>MemeTracker connects to the Dogecoin P2P network, requests the mempool, and listens for transaction inventory and raw transactions. It also tracks a rolling <strong>~24 hour</strong> header window and scans new block bodies so a payment that reaches a miner without appearing in your mempool view can still be recorded. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, time, and DOGE amount and stores it under your data directory.</p>
+          <p>MemeTracker connects to the Dogecoin P2P network and watches the <strong>mempool first</strong> (inventory and raw transactions). Headers and tip-block scans are only a <strong>backup</strong> if a payment skips mempool relay and is mined immediately. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, time, and DOGE amount and stores it under your data directory.</p>
           <h3>Dashboard</h3>
           <p>Summary counters plus <strong>live trend charts</strong> (mempool visibility, connected workers, stored rows and tracked addresses) built from browser polling while you keep the dashboard open. Header safeguard stats show tip hash/time, headers kept, blocks scanned, and payments first seen from blocks.</p>
           <h3>Start / Stop</h3>
           <p><strong>Start</strong> writes <span class="mono">memetracker_config.json</span> and launches workers. <strong>Stop</strong> signals workers to exit between connections (an active peer session may take a short while). A complete config file on disk can auto-start P2P when the process launches.</p>
           <h3>Configuration</h3>
           <p>Adjusts retention and per-address tx cap in <span class="mono">settings.json</span> without restarting P2P.</p>
-          <h3>Track address</h3>
-          <p>Same as <span class="mono">GET|POST /track/{address}</span>. Keeps the address watched and bumps retention.</p>
-          <h3>Tracked addresses / Transactions</h3>
-          <p>On-disk mirror of what you are watching and what was detected. Removing an address deletes its file and tx history in the app.</p>
+          <h3>Tracked addresses</h3>
+          <p>Add or refresh a watched P2PKH address (same as <span class="mono">GET|POST /track/{address}</span>), and manage the on-disk list. Remove deletes the address file and its stored txs. The Transactions table lists <strong>matched payments only</strong>, not every mempool transaction.</p>
+          <h3>Transactions</h3>
+          <p>On-disk mirror of detected payments to watched addresses. Mempool size on the dashboard is a visibility counter. Peers &amp; mempool shows the latest raw tx bodies downloaded for matching.</p>
           <h3>Header / block safeguard</h3>
-          <p>After handshake, workers send <span class="mono">sendheaders</span>, request <span class="mono">getheaders</span>, and <span class="mono">getdata</span> for new block hashes. Headers older than about 24 hours are dropped from memory. On connect, parents within that window can be walked back so recent history is covered. This is not a full chain sync; it is a tip-focused safety net for missed mempool relay.</p>
+          <p><strong>Backup only.</strong> Mempool watching always has priority. Workers track tip headers (<span class="mono">sendheaders</span> / <span class="mono">getheaders</span>), save the verified tip to <span class="mono">header_tip.json</span>, and only scan a recent tip block body when mempool traffic is quiet. That catches watched payments that skipped mempool relay and went straight into a block. This is not a full chain sync and must not starve mempool <span class="mono">getdata</span>.</p>
           <h3>Double-spend detection (mempool)</h3>
           <p>MemeTracker also checks transaction <strong>inputs</strong> while watching live mempool traffic. If two or more mempool transactions spend the same previous output (same <span class="mono">prev_txid:vout</span>), they are flagged as a conflict and shown with a red <strong>Double spent detected</strong> badge. This check is live-window only: once transactions disappear from the current mempool tracking window, they are no longer actively compared. The feature is intended for transactions related to watched payment addresses.</p>
           <h3>API access</h3>
@@ -575,9 +624,9 @@ curl -s -X POST BASE/api/stop</code></pre>
 curl -s "BASE/my-secret-token/track/YourP2PKHAddress"</code></pre>
           <p class="muted">Token URL form: <span class="mono">BASE/{api_token}/track/...</span> and <span class="mono">BASE/{api_token}/api/...</span>. Valid token bypasses the IP allowlist. Without a token prefix, IP allowlist rules apply.</p>
           <h3>Double-spend flag in API data</h3>
-          <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span> (<span class="mono">true</span>/<span class="mono">false</span>) so automation can detect conflicting mempool spends.</p>
+          <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span>, <span class="mono">confirmed</span>, and <span class="mono">confirmations</span> (0-5, from headers/blocks after inclusion).</p>
           <h3>Header safeguard in API data</h3>
-          <p>Object <span class="mono">header_safeguard</span> includes tip hash/time, headers kept, blocks scanned, and <span class="mono">confirmed_hits</span> (payments newly stored from block body scans).</p>
+          <p>Object <span class="mono">header_safeguard</span> includes tip hash, tip height (when known), tip time, headers kept, blocks scanned, <span class="mono">confirmed_hits</span>, and whether the tip was resumed from disk.</p>
           <h3>Remove address / tx row</h3>
           <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
 curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
@@ -730,6 +779,101 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
   var HIST_MAX = 90;
   var hist = { t: [], mempool: [], peers: [], stored: [], addrs: [] };
   var dashCharts = { mempool: null, peers: null, store: null };
+  var mempoolView = {
+    allOpen: false,
+    loading: false,
+    nextOffset: 0,
+    hasMore: true,
+    total: 0,
+    loaded: 0
+  };
+
+  function renderMempoolRows(tbody, ids, startIndex) {
+    if (!tbody) return;
+    ids.forEach(function(txid, i) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = '<td data-label="#">' + escapeHtml(String(startIndex + i + 1)) + '</td>' +
+        '<td data-label="Txid" class="mono">' + escapeHtml(txid) +
+        ' <button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(txid) + '" title="Copy txid" aria-label="Copy txid"><span class="material-icons" aria-hidden="true">content_copy</span></button></td>';
+      tbody.appendChild(tr);
+    });
+  }
+
+  function updateMempoolRecent(st) {
+    var mpc = $("#mempool-list-count");
+    var tbm = $("#tbody-mempool");
+    if (mpc) mpc.textContent = String(st.mempool_tx_count != null ? st.mempool_tx_count : 0);
+    if (!tbm || mempoolView.allOpen) return;
+    var ids = st.mempool_txids_recent || [];
+    tbm.innerHTML = "";
+    if (!ids.length) {
+      var emptyMp = document.createElement("tr");
+      emptyMp.innerHTML = '<td colspan="2" class="muted">No mempool tx ids seen yet.</td>';
+      tbm.appendChild(emptyMp);
+      return;
+    }
+    renderMempoolRows(tbm, ids, 0);
+  }
+
+  function setMempoolAllMeta() {
+    var meta = $("#mempool-all-meta");
+    var sent = $("#mempool-all-sentinel");
+    if (meta) {
+      meta.textContent = "Loaded " + mempoolView.loaded + " of " + mempoolView.total;
+    }
+    if (sent) {
+      if (mempoolView.loading) sent.textContent = "Loading…";
+      else if (mempoolView.hasMore) sent.textContent = "Scroll for more…";
+      else sent.textContent = mempoolView.total ? "End of list" : "No mempool tx ids seen yet.";
+    }
+  }
+
+  async function loadMempoolPage(reset) {
+    if (mempoolView.loading) return;
+    if (!reset && !mempoolView.hasMore) return;
+    mempoolView.loading = true;
+    setMempoolAllMeta();
+    try {
+      var offset = reset ? 0 : mempoolView.nextOffset;
+      var page = await api("/api/mempool?offset=" + offset + "&limit=50");
+      var tbody = $("#tbody-mempool-all");
+      if (!tbody) return;
+      if (reset) {
+        tbody.innerHTML = "";
+        mempoolView.loaded = 0;
+      }
+      var ids = page.txids || [];
+      renderMempoolRows(tbody, ids, mempoolView.loaded);
+      mempoolView.loaded += ids.length;
+      mempoolView.total = page.total || 0;
+      mempoolView.nextOffset = page.next_offset != null ? page.next_offset : (offset + ids.length);
+      mempoolView.hasMore = !!page.has_more;
+      var mpc = $("#mempool-list-count");
+      if (mpc) mpc.textContent = String(mempoolView.total);
+    } catch (e) {
+      console.error(e);
+      var sent = $("#mempool-all-sentinel");
+      if (sent) sent.textContent = "Failed to load: " + (e.message || e);
+    } finally {
+      mempoolView.loading = false;
+      setMempoolAllMeta();
+    }
+  }
+
+  function openMempoolAll() {
+    mempoolView.allOpen = true;
+    $("#mempool-recent-panel").classList.add("hidden");
+    $("#mempool-all-panel").classList.remove("hidden");
+    mempoolView.nextOffset = 0;
+    mempoolView.hasMore = true;
+    loadMempoolPage(true);
+  }
+
+  function closeMempoolAll() {
+    mempoolView.allOpen = false;
+    $("#mempool-all-panel").classList.add("hidden");
+    $("#mempool-recent-panel").classList.remove("hidden");
+  }
 
   function chartTheme() {
     return {
@@ -912,15 +1056,33 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       var dash = $("#dash-stats");
       dash.innerHTML = "";
       var hs = st.header_safeguard || {};
-      var tipLabel = hs.tip_hash ? String(hs.tip_hash).slice(0, 12) + "..." : "n/a";
+      var tipHash = hs.tip_hash ? String(hs.tip_hash) : "";
+      $("#tip-height").textContent = (hs.tip_height != null && hs.tip_height !== "") ? String(hs.tip_height) : "n/a";
+      $("#tip-hash").textContent = tipHash || "n/a";
+      var tipCopy = $("#tip-copy");
+      if (tipHash) {
+        tipCopy.classList.remove("hidden");
+        tipCopy.setAttribute("data-copy-tx", tipHash);
+      } else {
+        tipCopy.classList.add("hidden");
+        tipCopy.setAttribute("data-copy-tx", "");
+      }
+      var tipMetaParts = [];
+      if (hs.tip_time_utc) tipMetaParts.push("Time " + hs.tip_time_utc);
+      if (hs.resumed_from_disk) tipMetaParts.push("Resumed from disk");
+      if (hs.persist_path) tipMetaParts.push(hs.persist_path);
+      $("#tip-meta").textContent = tipMetaParts.join(" · ");
+      var tipLabel = tipHash ? tipHash.slice(0, 12) + "..." : "n/a";
       var tipHint = hs.tip_time_utc ? ("Tip time " + hs.tip_time_utc) : "Waiting for headers/blocks while P2P runs.";
+      var heightLabel = (hs.tip_height != null && hs.tip_height !== "") ? String(hs.tip_height) : "n/a";
       var statRows = [
         { k: "P2P running", v: run ? "yes" : "no", hint: run ? "Workers rotate peers between sessions." : "Start from the banner or use a complete memetracker_config.json." },
         { k: "Tracked addresses", v: st.watched_addresses },
         { k: "Stored tx rows", v: st.stored_transaction_rows },
         { k: "Mempool (unique tx ids)", v: st.mempool_tx_count, hint: run ? "Relay visibility on current peer sessions." : "Starts counting when P2P is running." },
         { k: "P2P workers connected", v: st.peers_connected_count, hint: run ? "Sessions with an open peer right now." : "n/a" },
-        { k: "Header tip", v: tipLabel, hint: tipHint },
+        { k: "Header tip height", v: heightLabel, hint: tipHint },
+        { k: "Header tip hash", v: tipLabel, hint: tipHash ? "Full hash in Header tip card (copy button)." : tipHint },
         { k: "Headers kept (~24h)", v: hs.headers_kept != null ? hs.headers_kept : 0 },
         { k: "Blocks scanned", v: hs.blocks_scanned != null ? hs.blocks_scanned : 0, hint: "Bodies scanned for watched payments." },
         { k: "Confirmed via blocks", v: hs.confirmed_hits != null ? hs.confirmed_hits : 0, hint: "New rows stored from block scans (mempool miss safeguard)." }
@@ -932,6 +1094,8 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         d.innerHTML = '<div class="statVAL">' + escapeHtml(String(row.v)) + '</div><div class="statLBL">' + escapeHtml(row.k) + "</div>" + hint;
         dash.appendChild(d);
       });
+
+      updateMempoolRecent(st);
 
       recordHistory(st);
       updateDashCharts();
@@ -963,11 +1127,18 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         var txidEsc = escapeHtml(tx.txid);
         var explore = sochainTxURL(tx.txid);
         var dsBadge = tx.double_spent ? ' <span class="pill warn">Double spent detected</span>' : "";
+        var confN = Number(tx.confirmations) || 0;
+        if (confN < 0) confN = 0;
+        if (confN > 5) confN = 5;
+        var statusBadge = tx.confirmed
+          ? '<span class="pill">confirmed ' + confN + '/5</span>'
+          : '<span class="pill off">unconfirmed</span>';
         tr.innerHTML = '<td data-label="Time">' + escapeHtml(tx.datetime) + '</td>' +
           '<td data-label="Address" class="mono">' + escapeHtml(tx.address) + '</td>' +
           '<td data-label="Txid" class="mono txid-cell"><span class="txid-line">' + txidEsc +
           '<button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(tx.txid) + '" title="Copy txid" aria-label="Copy txid"><span class="material-icons" aria-hidden="true">content_copy</span></button></span></td>' +
           '<td data-label="DOGE">' + escapeHtml(Number(tx.amount_doge).toFixed(8)) + dsBadge + '</td>' +
+          '<td data-label="Status">' + statusBadge + '</td>' +
           '<td data-label="Explorer / remove" class="row-actions"><div class="tx-links">' +
           '<a class="btn btn-sm btn-with-icon" href="' + explore + '" target="_blank" rel="noopener noreferrer"><span class="material-icons" aria-hidden="true">open_in_new</span><span>sochain</span></a>' +
           '<button type="button" class="btn btn-danger btn-sm btn-with-icon" data-rm-tx="' + encodeURIComponent(tx.hash160_hex) + '" data-txid="' + escapeHtml(tx.txid) + '"><span class="material-icons" aria-hidden="true">delete_outline</span><span>Remove</span></button>' +
@@ -995,6 +1166,25 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
           '<td data-label="Updated">' + escapeHtml(p.updated) + '</td>';
         tp.appendChild(tr);
       });
+
+      var trb = $("#tbody-recent-tx");
+      if (trb) {
+        trb.innerHTML = "";
+        var bodies = st.recent_tx_bodies || [];
+        if (!bodies.length) {
+          var empty = document.createElement("tr");
+          empty.innerHTML = '<td colspan="2" class="muted">No tx bodies received yet.</td>';
+          trb.appendChild(empty);
+        } else {
+          bodies.forEach(function(txid, i) {
+            var tr = document.createElement("tr");
+            tr.innerHTML = '<td data-label="#">' + escapeHtml(String(i + 1)) + '</td>' +
+              '<td data-label="Txid" class="mono">' + escapeHtml(txid) +
+              ' <button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(txid) + '" title="Copy txid" aria-label="Copy txid"><span class="material-icons" aria-hidden="true">content_copy</span></button></td>';
+            trb.appendChild(tr);
+          });
+        }
+      }
     } catch (e) {
       console.error(e);
     }
@@ -1006,7 +1196,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       var txid = copyB.getAttribute("data-copy-tx");
       try {
         await navigator.clipboard.writeText(txid);
-        showFlash("Txid copied to clipboard.", true);
+        showFlash("Copied to clipboard.", true);
       } catch (_) {
         showFlash("Could not copy (clipboard permission).", false);
       }
@@ -1136,6 +1326,20 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       showFlash("API access settings saved to memetracker_config.json.", true);
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#btn-mempool-see-all").addEventListener("click", function() {
+    openMempoolAll();
+  });
+  $("#btn-mempool-show-recent").addEventListener("click", function() {
+    closeMempoolAll();
+  });
+  $("#mempool-all-scroll").addEventListener("scroll", function() {
+    if (!mempoolView.allOpen || mempoolView.loading || !mempoolView.hasMore) return;
+    var el = $("#mempool-all-scroll");
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 80) {
+      loadMempoolPage(false);
+    }
   });
 
   setInterval(refreshAll, 4000);

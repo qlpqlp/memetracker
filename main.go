@@ -2,10 +2,9 @@
 //
 // Copyright (c) Paulo Vidal · https://x.com/inevitable360 · Dogecoin Foundation Dev
 //
-// MemeTracker connects to Dogecoin peers to observe the relay mempool (mempool /
-// inv / getdata / tx / ping) and also tracks a rolling ~24h header window with
-// block body scans as a safeguard when a payment reaches a miner without being
-// seen first in the mempool view.
+// Priority 1: mempool watching (mempool / inv / getdata / tx / ping) must not fail.
+// Priority 2: header tip tracking + rare tip-block scans as backup when a watched
+// payment skips mempool relay and is mined immediately.
 package main
 
 import (
@@ -45,12 +44,16 @@ const (
 	MSG_TX              = 1 // inventory type for transactions (and MSG_TX|MSG_WITNESS_FLAG for segwit)
 	NODE_NETWORK        = 1 << 0
 	NODE_WITNESS        = 1 << 3
-	GETDATA_BATCH       = 48
-	MAX_TX_FETCH_INV    = 200
+	GETDATA_BATCH       = 100
+	MAX_TX_FETCH_INV    = 500 // per inv; mark requested so large mempool dumps progress past this window
 	MEMPOOL_RESYNC_SEC  = 90
 	MEMPOOL_WATCHER_SEC = 3
 	P2P_READ_IDLE_SEC   = 20
 	SESSION_SEC         = 300
+	MAX_CONFIRMATIONS   = 5 // UI/API display cap for confirmation depth
+	MEMPOOL_UI_RECENT   = 20
+	MEMPOOL_PAGE_DEFAULT = 50
+	MEMPOOL_PAGE_MAX    = 100
 )
 
 //go:embed static/*
@@ -749,6 +752,30 @@ func summarizeOutgoingVersionPayload(p []byte, destPort int) string {
 }
 
 // First fields of peer's version message (variable user_agent; we only decode fixed prefix + try UA).
+func parsePeerStartHeight(p []byte) int32 {
+	if len(p) < 20 {
+		return 0
+	}
+	off := 20 + 26 + 26
+	if len(p) < off+8 {
+		return 0
+	}
+	off += 8
+	if off >= len(p) {
+		return 0
+	}
+	off2 := off
+	uaLen64, err := readVarInt(p, &off2)
+	if err != nil || uaLen64 > 4096 || off2+int(uaLen64) > len(p) {
+		return 0
+	}
+	off2 += int(uaLen64)
+	if off2+4 > len(p) {
+		return 0
+	}
+	return int32(binary.LittleEndian.Uint32(p[off2 : off2+4]))
+}
+
 func summarizePeerVersionPayload(p []byte) string {
 	if len(p) < 20 {
 		return fmt.Sprintf("len=%d (too short for version prefix)", len(p))
@@ -891,10 +918,33 @@ func buildVersionPayload(p2pPort int) []byte {
 // ------- Store (file-backed DB) -------
 
 type TxRecord struct {
-	Txid        string  `json:"txid"`
-	Datetime    string  `json:"datetime"`
-	AmountDoge  float64 `json:"amount_doge"`
-	DoubleSpent bool    `json:"double_spent"`
+	Txid          string  `json:"txid"`
+	Datetime      string  `json:"datetime"`
+	AmountDoge    float64 `json:"amount_doge"`
+	DoubleSpent   bool    `json:"double_spent"`
+	Confirmed     bool    `json:"confirmed"`
+	Confirmations int     `json:"confirmations"` // 0..MAX_CONFIRMATIONS (headers/blocks since inclusion)
+	BlockHeight   int64   `json:"block_height,omitempty"`
+}
+
+func clampConfirmations(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > MAX_CONFIRMATIONS {
+		return MAX_CONFIRMATIONS
+	}
+	return n
+}
+
+func confirmationsFromHeights(blockHeight, tipHeight int64) int {
+	if blockHeight < 0 {
+		return 1 // seen in a block but height unknown
+	}
+	if tipHeight < 0 || tipHeight < blockHeight {
+		return 1
+	}
+	return clampConfirmations(int(tipHeight - blockHeight + 1))
 }
 
 type AddressData struct {
@@ -1096,10 +1146,12 @@ func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge floa
 	}
 
 	rec := TxRecord{
-		Txid:        txid,
-		Datetime:    dt.UTC().Format(time.RFC3339),
-		AmountDoge:  amountDoge,
-		DoubleSpent: doubleSpent,
+		Txid:          txid,
+		Datetime:      dt.UTC().Format(time.RFC3339),
+		AmountDoge:    amountDoge,
+		DoubleSpent:   doubleSpent,
+		Confirmed:     false,
+		Confirmations: 0,
 	}
 
 	// Store newest first.
@@ -1109,6 +1161,74 @@ func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge floa
 	}
 	_ = s.persistAddressLocked(ad)
 	return true
+}
+
+// NoteTxConfirmed marks a stored payment as included in a block and sets
+// confirmations from block height vs tip (capped at MAX_CONFIRMATIONS).
+func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool {
+	if strings.TrimSpace(txid) == "" {
+		return false
+	}
+	confs := confirmationsFromHeights(blockHeight, tipHeight)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for _, ad := range s.watchByHash {
+		adChanged := false
+		for i := range ad.Txs {
+			if ad.Txs[i].Txid != txid {
+				continue
+			}
+			tx := &ad.Txs[i]
+			if !tx.Confirmed {
+				tx.Confirmed = true
+				adChanged = true
+			}
+			if blockHeight >= 0 && (tx.BlockHeight <= 0 || tx.BlockHeight > blockHeight) {
+				tx.BlockHeight = blockHeight
+				adChanged = true
+			}
+			want := confs
+			if tx.BlockHeight > 0 {
+				want = confirmationsFromHeights(tx.BlockHeight, tipHeight)
+			}
+			if tx.Confirmations != want {
+				tx.Confirmations = want
+				adChanged = true
+			}
+		}
+		if adChanged {
+			_ = s.persistAddressLocked(ad)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// RefreshConfirmations updates confirmation counts for already-confirmed txs as tip advances.
+func (s *Store) RefreshConfirmations(tipHeight int64) {
+	if tipHeight < 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ad := range s.watchByHash {
+		adChanged := false
+		for i := range ad.Txs {
+			tx := &ad.Txs[i]
+			if !tx.Confirmed || tx.BlockHeight <= 0 {
+				continue
+			}
+			want := confirmationsFromHeights(tx.BlockHeight, tipHeight)
+			if tx.Confirmations != want {
+				tx.Confirmations = want
+				adChanged = true
+			}
+		}
+		if adChanged {
+			_ = s.persistAddressLocked(ad)
+		}
+	}
 }
 
 func (s *Store) MarkTxDoubleSpent(txid string) bool {
@@ -1240,6 +1360,9 @@ func (s *Store) FlattenTransactions() []map[string]any {
 				"datetime":      tx.Datetime,
 				"amount_doge":   tx.AmountDoge,
 				"double_spent":  tx.DoubleSpent,
+				"confirmed":     tx.Confirmed,
+				"confirmations": clampConfirmations(tx.Confirmations),
+				"block_height":  tx.BlockHeight,
 			})
 		}
 	}
@@ -1311,13 +1434,16 @@ type peerSession struct {
 }
 
 type MetricsCollector struct {
-	mu            sync.RWMutex
-	byWorker      map[int]peerSession // one logical session per P2P worker
-	mempoolTxIDs  map[string]struct{}
-	maxMempoolIDs int
-	outpointToTxs map[string]map[string]struct{}
-	txToOutpoints map[string][]string
-	doubleSpentTx map[string]bool
+	mu             sync.RWMutex
+	byWorker       map[int]peerSession // one logical session per P2P worker
+	mempoolTxIDs   map[string]struct{}
+	mempoolOrder   []string // newest first; used for recent + paginated listing
+	maxMempoolIDs  int
+	outpointToTxs  map[string]map[string]struct{}
+	txToOutpoints  map[string][]string
+	doubleSpentTx  map[string]bool
+	recentTxBodies []string // newest last; raw TX messages received (not full mempool dump)
+	maxRecentTx    int
 }
 
 func NewMetricsCollector(maxMempool int) *MetricsCollector {
@@ -1325,12 +1451,15 @@ func NewMetricsCollector(maxMempool int) *MetricsCollector {
 		maxMempool = 50000
 	}
 	return &MetricsCollector{
-		byWorker:      make(map[int]peerSession),
-		mempoolTxIDs:  make(map[string]struct{}),
-		maxMempoolIDs: maxMempool,
-		outpointToTxs: make(map[string]map[string]struct{}),
-		txToOutpoints: make(map[string][]string),
-		doubleSpentTx: make(map[string]bool),
+		byWorker:       make(map[int]peerSession),
+		mempoolTxIDs:   make(map[string]struct{}),
+		mempoolOrder:   make([]string, 0, 1024),
+		maxMempoolIDs:  maxMempool,
+		outpointToTxs:  make(map[string]map[string]struct{}),
+		txToOutpoints:  make(map[string][]string),
+		doubleSpentTx:  make(map[string]bool),
+		recentTxBodies: make([]string, 0, 40),
+		maxRecentTx:    40,
 	}
 }
 
@@ -1366,20 +1495,83 @@ func (m *MetricsCollector) observeMempoolTxid(txid string) {
 	if _, ok := m.mempoolTxIDs[txid]; ok {
 		return
 	}
-	for len(m.mempoolTxIDs) >= m.maxMempoolIDs {
-		for k := range m.mempoolTxIDs {
-			delete(m.mempoolTxIDs, k)
-			m.dropTxLocked(k)
-			break
-		}
+	for len(m.mempoolOrder) >= m.maxMempoolIDs {
+		old := m.mempoolOrder[len(m.mempoolOrder)-1]
+		m.mempoolOrder = m.mempoolOrder[:len(m.mempoolOrder)-1]
+		delete(m.mempoolTxIDs, old)
+		m.dropTxLocked(old)
 	}
 	m.mempoolTxIDs[txid] = struct{}{}
+	m.mempoolOrder = append([]string{txid}, m.mempoolOrder...)
+}
+
+func (m *MetricsCollector) noteTxBody(txid string) {
+	if txid == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recentTxBodies = append(m.recentTxBodies, txid)
+	if m.maxRecentTx > 0 && len(m.recentTxBodies) > m.maxRecentTx {
+		m.recentTxBodies = append([]string(nil), m.recentTxBodies[len(m.recentTxBodies)-m.maxRecentTx:]...)
+	}
+}
+
+func (m *MetricsCollector) recentTxBodySnapshot() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, len(m.recentTxBodies))
+	copy(out, m.recentTxBodies)
+	return out
 }
 
 func (m *MetricsCollector) snapshot() (mempoolN int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return len(m.mempoolTxIDs)
+	return len(m.mempoolOrder)
+}
+
+// mempoolRecent returns up to limit newest-first txids for the dashboard strip.
+func (m *MetricsCollector) mempoolRecent(limit int) []string {
+	if limit <= 0 {
+		limit = MEMPOOL_UI_RECENT
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if limit > len(m.mempoolOrder) {
+		limit = len(m.mempoolOrder)
+	}
+	out := make([]string, limit)
+	copy(out, m.mempoolOrder[:limit])
+	return out
+}
+
+// mempoolPage returns a newest-first page for progressive UI loading.
+func (m *MetricsCollector) mempoolPage(offset, limit int) (ids []string, total, nextOffset int, hasMore bool) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = MEMPOOL_PAGE_DEFAULT
+	}
+	if limit > MEMPOOL_PAGE_MAX {
+		limit = MEMPOOL_PAGE_MAX
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	total = len(m.mempoolOrder)
+	if offset >= total {
+		return []string{}, total, offset, false
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	ids = make([]string, end-offset)
+	copy(ids, m.mempoolOrder[offset:end])
+	nextOffset = end
+	hasMore = end < total
+	return ids, total, nextOffset, hasMore
 }
 
 func (m *MetricsCollector) registerTrackedTxInputs(txid string, inputs []txInputOutpoint) []string {
@@ -1522,9 +1714,13 @@ func submitDogeboxMetrics(store *Store, col *MetricsCollector) {
 
 // ------- P2P watcher -------
 
+// ProcessedSet tracks txids already requested via getdata and/or inspected from a
+// tx body. Without marking non-matches, large mempool inv dumps keep refetching
+// the same first MAX_TX_FETCH_INV entries and never reach later payments.
 type ProcessedSet struct {
-	mu sync.Mutex
-	m  map[string]struct{}
+	mu  sync.Mutex
+	m   map[string]struct{}
+	max int
 }
 
 type PaymentCallbackPayload struct {
@@ -1563,10 +1759,13 @@ func notifyCallback(callbackURL string, payload PaymentCallbackPayload) {
 }
 
 func NewProcessedSet() *ProcessedSet {
-	return &ProcessedSet{m: make(map[string]struct{})}
+	return &ProcessedSet{m: make(map[string]struct{}), max: 100000}
 }
 
 func (ps *ProcessedSet) Has(k string) bool {
+	if k == "" {
+		return false
+	}
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	_, ok := ps.m[k]
@@ -1574,8 +1773,20 @@ func (ps *ProcessedSet) Has(k string) bool {
 }
 
 func (ps *ProcessedSet) Add(k string) {
+	if k == "" {
+		return
+	}
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if _, ok := ps.m[k]; ok {
+		return
+	}
+	for ps.max > 0 && len(ps.m) >= ps.max {
+		for old := range ps.m {
+			delete(ps.m, old)
+			break
+		}
+	}
 	ps.m[k] = struct{}{}
 }
 
@@ -1615,7 +1826,7 @@ func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p
 		parallel = 8
 	}
 	if htrack == nil {
-		htrack = NewHeaderTracker()
+		htrack = NewHeaderTracker("")
 	}
 	for w := 0; w < parallel; w++ {
 		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, stop)
@@ -1711,8 +1922,9 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 
 // considerWatchedPayment matches outputs against watched addresses and stores hits.
 // When fromMempool is true, double-spend tracking runs on inputs.
+// When fromMempool is false, blockHeight/tipHeight update confirmed + confirmations (0..5).
 // Returns how many new address rows were inserted.
-func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *MetricsCollector, raw []byte, fromMempool bool, logf, logv func(string, ...any)) int {
+func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *MetricsCollector, raw []byte, fromMempool bool, blockHeight, tipHeight int64, logf, logv func(string, ...any)) int {
 	if len(raw) == 0 {
 		return 0
 	}
@@ -1730,9 +1942,12 @@ func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *Metrics
 	}
 	txid := txidHex(raw)
 	wtxid := wtxidHex(raw)
-	if processed.Has(txid) || processed.Has(wtxid) {
-		return 0
-	}
+	// Always mark inspected so getdata can progress through large mempool dumps.
+	// Matching still runs even if the id was already marked when getdata was sent.
+	defer func() {
+		processed.Add(txid)
+		processed.Add(wtxid)
+	}()
 
 	amtByHash := make(map[string]int64)
 	store.mu.RLock()
@@ -1786,9 +2001,12 @@ func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *Metrics
 			}
 		}
 	}
+	if !fromMempool {
+		if store.NoteTxConfirmed(txid, blockHeight, tipHeight) {
+			logv("tx confirmed in block txid=%s height=%d tip=%d", txid, blockHeight, tipHeight)
+		}
+	}
 	if inserted > 0 {
-		processed.Add(txid)
-		processed.Add(wtxid)
 		logf("tx matched watched address(es) txid=%s inserted=%d mempool=%v", txid, inserted, fromMempool)
 	}
 	return inserted
@@ -1809,6 +2027,9 @@ func sendGetHeaders(conn net.Conn, htrack *HeaderTracker, logf, logv func(string
 func queueBlockFetches(conn net.Conn, htrack *HeaderTracker, hashHexes []string, logf, logv func(string, ...any)) error {
 	pending := make([]string, 0, MAX_BLOCK_FETCH_INV)
 	for _, hx := range hashHexes {
+		if !htrack.WantBlockBody(hx) {
+			continue
+		}
 		if !htrack.NeedBlock(hx) {
 			continue
 		}
@@ -1849,16 +2070,22 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 	if hashHex == "" {
 		return nil
 	}
+	tipH := htrack.TipHeight()
+	store.RefreshConfirmations(tipH)
 	if htrack.AlreadyScanned(hashHex) {
 		htrack.ClearPending(hashHex)
 		return nil
+	}
+	blockH := htrack.HeaderHeight(hashHex)
+	if blockH < 0 && tipH >= 0 && hashHex == htrack.TipHash() {
+		blockH = tipH
 	}
 	hits := 0
 	err := forEachBlockTxRaw(payload, func(idx int, txRaw []byte) error {
 		if idx == 0 {
 			return nil // skip coinbase
 		}
-		n := considerWatchedPayment(store, processed, mcol, txRaw, false, logf, logv)
+		n := considerWatchedPayment(store, processed, mcol, txRaw, false, blockH, tipH, logf, logv)
 		hits += n
 		return nil
 	})
@@ -1874,22 +2101,20 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 	} else {
 		logv("block scanned hash=%s no new watched payments", hashHex)
 	}
-	var want []string
-	if parent := htrack.ParentToBackfill(); parent != "" {
-		want = append(want, parent)
-	}
-	return want
+	// Do not chain-walk parent bodies here; mempool stays first, tip block is enough backup.
+	return nil
 }
 
 func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, p2pPort int, logf, logv func(string, ...any)) {
 	if htrack == nil {
-		htrack = NewHeaderTracker()
+		htrack = NewHeaderTracker("")
 	}
 	gotVerack := false
 	mempoolSent := false
 	headersEnabled := false
 	lastMempoolResync := time.Time{}
 	lastGetHeaders := time.Time{}
+	lastTxActivity := time.Time{}
 	start := time.Now()
 	var sessionExit error
 
@@ -1910,16 +2135,38 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 	}
 	logv("wrote version message ok")
 
-	maybeHeaderMaintenance := func() error {
+	mempoolBusy := func() bool {
+		if store.watcherCount() == 0 {
+			return false
+		}
+		// With watchers, mempool always wins. Skip block backup until we have seen
+		// mempool traffic and then a quiet window (no recent tx/inv).
+		if lastTxActivity.IsZero() {
+			return true
+		}
+		return time.Since(lastTxActivity) < 20*time.Second
+	}
+
+	maybeHeaderMaintenance := func(allowBackfill bool) error {
 		if !gotVerack || !headersEnabled {
 			return nil
 		}
-		if parent := htrack.ParentToBackfill(); parent != "" {
-			if err := queueBlockFetches(conn, htrack, []string{parent}, logf, logv); err != nil {
-				return err
+		if mempoolBusy() {
+			return nil
+		}
+		// Backup only: optional tiny parent backfill when idle and no recent mempool activity.
+		if allowBackfill && store.watcherCount() == 0 {
+			if parent := htrack.ParentToBackfill(); parent != "" {
+				if err := queueBlockFetches(conn, htrack, []string{parent}, logf, logv); err != nil {
+					return err
+				}
 			}
 		}
-		if time.Since(lastGetHeaders) >= time.Duration(GETHEADERS_TOPUP_SEC)*time.Second {
+		topup := time.Duration(GETHEADERS_TOPUP_SEC) * time.Second
+		if store.watcherCount() == 0 {
+			topup = time.Duration(GETHEADERS_TOPUP_IDLE_SEC) * time.Second
+		}
+		if time.Since(lastGetHeaders) >= topup {
 			if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
 				return err
 			}
@@ -1954,7 +2201,7 @@ readLoop:
 						logf("mempool periodic watchers=%d interval=%ds", nw, interval)
 					}
 				}
-				if err := maybeHeaderMaintenance(); err != nil {
+				if err := maybeHeaderMaintenance(true); err != nil {
 					sessionExit = err
 					break readLoop
 				}
@@ -2016,6 +2263,7 @@ readLoop:
 		case "version":
 			logf("recv VERSION from peer=%s - %s", stateLastPeer, summarizePeerVersionPayload(payload))
 			logv("peer version payload head hex=%s", hexSnippet(payload, 256))
+			htrack.NotePeerStartHeight(parsePeerStartHeight(payload))
 			ack := buildMessage("verack", nil)
 			_, werr := conn.Write(ack)
 			if werr != nil {
@@ -2068,8 +2316,10 @@ readLoop:
 		case "tx":
 			txidEarly := txidHex(payload)
 			mcol.observeMempoolTxid(txidEarly)
+			mcol.noteTxBody(txidEarly)
+			lastTxActivity = time.Now()
 			logv("recv TX raw len=%d txid_le=%s", len(payload), txidEarly)
-			_ = considerWatchedPayment(store, processed, mcol, payload, true, logf, logv)
+			_ = considerWatchedPayment(store, processed, mcol, payload, true, -1, -1, logf, logv)
 
 		case "headers":
 			hdrs, err := decodeHeadersPayload(payload)
@@ -2078,20 +2328,25 @@ readLoop:
 				continue
 			}
 			logf("recv HEADERS peer=%s count=%d", stateLastPeer, len(hdrs))
-			want := make([]string, 0, len(hdrs))
+			var tipHex string
 			for _, h80 := range hdrs {
 				hx, _ := htrack.RememberHeader80(h80)
-				if hx != "" && htrack.NeedBlock(hx) {
-					want = append(want, hx)
+				if hx != "" {
+					tipHex = hx // last in batch is newest from peer
 				}
 			}
-			if err := queueBlockFetches(conn, htrack, want, logf, logv); err != nil {
-				sessionExit = err
-				break readLoop
+			store.RefreshConfirmations(htrack.TipHeight())
+			// Backup tip body: always allow one tip fetch on new headers (missed+mined case).
+			// Parent backfill / inv block fetches still yield to mempool.
+			if tipHex != "" {
+				if err := queueBlockFetches(conn, htrack, []string{tipHex}, logf, logv); err != nil {
+					sessionExit = err
+					break readLoop
+				}
 			}
 			if len(hdrs) > 0 {
 				lastGetHeaders = time.Now()
-				if len(hdrs) >= 2000 {
+				if len(hdrs) >= 2000 && !mempoolBusy() {
 					if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
 						sessionExit = err
 						break readLoop
@@ -2101,12 +2356,8 @@ readLoop:
 			}
 
 		case "block":
-			logv("recv BLOCK payload_len=%d", len(payload))
-			wantParents := handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
-			if err := queueBlockFetches(conn, htrack, wantParents, logf, logv); err != nil {
-				sessionExit = err
-				break readLoop
-			}
+			logv("recv BLOCK payload_len=%d (backup scan)", len(payload))
+			_ = handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
 
 		case "inv":
 			if !gotVerack || !mempoolSent {
@@ -2139,60 +2390,70 @@ readLoop:
 			logf("recv INV peer=%s entries=%d tx_like=%d block_like=%d", stateLastPeer, len(invs), txLike, blockLike)
 			logv("inv payload_len=%d parse_ok entries=%d", len(payload), len(invs))
 
-			if err := queueBlockFetches(conn, htrack, blockHashes, logf, logv); err != nil {
-				sessionExit = err
-				break readLoop
+			if txLike > 0 {
+				lastTxActivity = time.Now()
 			}
 
 			store.mu.RLock()
 			hasWatchers := len(store.watchByHash) > 0
 			store.mu.RUnlock()
-			if !hasWatchers {
-				continue
+
+			// Priority 1: mempool tx getdata. Never let block backup delay this.
+			if hasWatchers {
+				fetch := make([]invItem, 0, MAX_TX_FETCH_INV)
+				invSeen := make(map[string]struct{})
+				for _, it := range invs {
+					if !invTypeIsTx(it.invType) {
+						continue
+					}
+					invKey := fmt.Sprintf("%x:%x", it.invType, it.hash)
+					if _, ok := invSeen[invKey]; ok {
+						continue
+					}
+					invSeen[invKey] = struct{}{}
+					txHashHex := reverseBytesToHex(it.hash)
+					if processed.Has(txHashHex) {
+						continue
+					}
+					// Mark before write so the next inv advances past this window
+					// (even if the peer never returns the body).
+					processed.Add(txHashHex)
+					fetch = append(fetch, it)
+					if len(fetch) >= MAX_TX_FETCH_INV {
+						break
+					}
+				}
+
+				getdataFail := false
+				for i := 0; i < len(fetch); i += GETDATA_BATCH {
+					j := i + GETDATA_BATCH
+					if j > len(fetch) {
+						j = len(fetch)
+					}
+					pl := buildGetdataPayload(fetch[i:j])
+					gd := buildMessage("getdata", pl)
+					if _, werr := conn.Write(gd); werr != nil {
+						sessionExit = werr
+						logf("write getdata failed peer=%s: %v", stateLastPeer, werr)
+						getdataFail = true
+						break
+					}
+					logv("sent GETDATA batch [%d:%d) n=%d msg_bytes=%d (tx hashes in getdata use same wire order as inv)", i, j, j-i, len(gd))
+				}
+				if getdataFail {
+					break readLoop
+				}
+				if len(fetch) > 0 {
+					logf("getdata dispatched total_tx_inv=%d peer=%s", len(fetch), stateLastPeer)
+				}
 			}
 
-			fetch := make([]invItem, 0, MAX_TX_FETCH_INV)
-			invSeen := make(map[string]struct{})
-			for _, it := range invs {
-				if !invTypeIsTx(it.invType) {
-					continue
+			// Priority 2 (backup): tip block bodies only when mempool is quiet.
+			if txLike == 0 && !mempoolBusy() && len(blockHashes) > 0 {
+				if err := queueBlockFetches(conn, htrack, blockHashes, logf, logv); err != nil {
+					sessionExit = err
+					break readLoop
 				}
-				invKey := fmt.Sprintf("%x:%x", it.invType, it.hash)
-				if _, ok := invSeen[invKey]; ok {
-					continue
-				}
-				invSeen[invKey] = struct{}{}
-				txHashHex := reverseBytesToHex(it.hash)
-				if processed.Has(txHashHex) {
-					continue
-				}
-				fetch = append(fetch, it)
-				if len(fetch) >= MAX_TX_FETCH_INV {
-					break
-				}
-			}
-
-			getdataFail := false
-			for i := 0; i < len(fetch); i += GETDATA_BATCH {
-				j := i + GETDATA_BATCH
-				if j > len(fetch) {
-					j = len(fetch)
-				}
-				pl := buildGetdataPayload(fetch[i:j])
-				gd := buildMessage("getdata", pl)
-				if _, werr := conn.Write(gd); werr != nil {
-					sessionExit = werr
-					logf("write getdata failed peer=%s: %v", stateLastPeer, werr)
-					getdataFail = true
-					break
-				}
-				logv("sent GETDATA batch [%d:%d) n=%d msg_bytes=%d (tx hashes in getdata use same wire order as inv)", i, j, j-i, len(gd))
-			}
-			if getdataFail {
-				break readLoop
-			}
-			if len(fetch) > 0 {
-				logf("getdata dispatched total_tx_inv=%d peer=%s", len(fetch), stateLastPeer)
 			}
 
 		default:
@@ -2216,7 +2477,7 @@ readLoop:
 				logv("periodic MEMPOOL resent interval=%ds watchers=%d", interval, nw)
 			}
 		}
-		if err := maybeHeaderMaintenance(); err != nil {
+		if err := maybeHeaderMaintenance(false); err != nil {
 			sessionExit = err
 			break readLoop
 		}
@@ -2624,7 +2885,7 @@ func (a *appState) startP2P() {
 	host := strings.TrimSpace(cfg.P2PHost)
 	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, cfg.P2PParallel, stopCh)
 	go runMetricsLoop(a.store, a.mcol, stopCh)
-	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=24h)", network, cfg.P2PParallel)
+	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=24h+resume)", network, cfg.P2PParallel)
 }
 
 func (a *appState) stopP2P() {
@@ -2742,6 +3003,8 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 		"watched_addresses":         app.store.watcherCount(),
 		"stored_transaction_rows":   app.store.StoredTransactionRows(),
 		"mempool_tx_count":          app.mcol.snapshot(),
+		"mempool_txids_recent":      app.mcol.mempoolRecent(MEMPOOL_UI_RECENT),
+		"recent_tx_bodies":          app.mcol.recentTxBodySnapshot(),
 		"peers_connected_count":     nConn,
 		"peers":                     peerOut,
 		"header_safeguard":          hs,
@@ -2761,6 +3024,34 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 			"retention_days":      rd,
 			"settings_file_note":  "list_limit and retention_days sync to settings.json from the Configuration tab when saved",
 		},
+	})
+}
+
+func apiGetMempool(w http.ResponseWriter, r *http.Request, app *appState) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	q := r.URL.Query()
+	offset, _ := strconv.Atoi(strings.TrimSpace(q.Get("offset")))
+	limit, _ := strconv.Atoi(strings.TrimSpace(q.Get("limit")))
+	if limit <= 0 {
+		limit = MEMPOOL_PAGE_DEFAULT
+	}
+	if limit > MEMPOOL_PAGE_MAX {
+		limit = MEMPOOL_PAGE_MAX
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	ids, total, nextOffset, hasMore := app.mcol.mempoolPage(offset, limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"txids":       ids,
+		"total":       total,
+		"offset":      offset,
+		"limit":       limit,
+		"next_offset": nextOffset,
+		"has_more":    hasMore,
 	})
 }
 
@@ -3031,7 +3322,10 @@ func main() {
 	}()
 
 	mcol := NewMetricsCollector(50000)
-	htrack := NewHeaderTracker()
+	htrack := NewHeaderTracker(storageDir)
+	if tip := htrack.TipHash(); tip != "" {
+		log.Printf("[MTR] header tip resumed from disk hash=%s path=%s", tip, filepath.Join(storageDir, headerTipFileName))
+	}
 	processed := NewProcessedSet()
 
 	effectiveCfg := MemeTrackerConfig{
@@ -3107,6 +3401,9 @@ func main() {
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		apiStatus(w, r, app)
+	})
+	mux.HandleFunc("/api/mempool", func(w http.ResponseWriter, r *http.Request) {
+		apiGetMempool(w, r, app)
 	})
 	mux.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
 		apiPostStart(w, r, app)
