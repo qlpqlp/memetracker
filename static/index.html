@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>MemeTracker — Dogecoin mempool watcher</title>
+  <title>MemeTracker - Dogecoin mempool watcher</title>
   <link rel="icon" href="/logo.png" type="image/png"/>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
@@ -356,7 +356,7 @@
       <button type="button" data-tab="addr"><span class="material-icons side-nav-ico" aria-hidden="true">account_balance_wallet</span><span class="side-nav-label">Tracked addresses</span></button>
       <button type="button" data-tab="tx"><span class="material-icons side-nav-ico" aria-hidden="true">receipt_long</span><span class="side-nav-label">Transactions</span></button>
       <button type="button" data-tab="peers"><span class="material-icons side-nav-ico" aria-hidden="true">device_hub</span><span class="side-nav-label">Peers &amp; mempool</span></button>
-      <button type="button" data-tab="security"><span class="material-icons side-nav-ico" aria-hidden="true">shield</span><span class="side-nav-label">API access (IPs)</span></button>
+      <button type="button" data-tab="security"><span class="material-icons side-nav-ico" aria-hidden="true">shield</span><span class="side-nav-label">API access</span></button>
       <button type="button" data-tab="help"><span class="material-icons side-nav-ico" aria-hidden="true">menu_book</span><span class="side-nav-label">Help &amp; API docs</span></button>
     </nav>
   </aside>
@@ -367,7 +367,7 @@
       <button type="button" class="nav-sidebar-toggle" id="nav-sidebar-toggle" title="Collapse or expand sidebar" aria-label="Collapse or expand sidebar"><span class="material-icons" id="nav-sidebar-toggle-icon" aria-hidden="true">chevron_left</span></button>
       <div class="topbar-titles">
         <h1>MemeTracker</h1>
-        <p class="sub">Dashboard — use the menu to navigate</p>
+        <p class="sub">Dashboard - use the menu to navigate</p>
       </div>
     </header>
 
@@ -398,11 +398,14 @@
           <div style="grid-column:1/-1">
             <label>API allowed IPs (optional)</label>
             <textarea class="code" name="api_allowed_ips_text" rows="3" placeholder="One per line or comma-separated. Empty = allow all. Example:&#10;127.0.0.1&#10;192.168.1.0/24"></textarea>
-            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Restrict <span class="mono">/api/*</span> and <span class="mono">/track/*</span>. Include <span class="mono">127.0.0.1</span> if you use this UI locally when listing specific IPs.</p>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Restrict <span class="mono">/api/*</span> and <span class="mono">/track/*</span> by client IP when no URL token is used. Include <span class="mono">127.0.0.1</span> if you use this UI locally when listing specific IPs.</p>
+            <label>API access token (optional)</label>
+            <input name="api_token" type="text" placeholder="empty = disabled; then use /{token}/track/ADDRESS"/>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">When set, callers can use <span class="mono">http://HOST/{token}/track/D...</span> (and <span class="mono">/{token}/api/...</span>) without matching the IP list. Requests without the token still follow the IP allowlist.</p>
           </div>
           <p style="margin:1rem 0 .5rem"><button type="submit" class="btn btn-primary btn-with-icon" id="btn-start"><span class="material-icons" aria-hidden="true">play_arrow</span><span>Start MemeTracker</span></button></p>
         </form>
-        <p class="muted" style="margin:0;font-size:.8rem">Config file: <span class="mono" id="cfg-path-hint">—</span></p>
+        <p class="muted" style="margin:0;font-size:.8rem">Config file: <span class="mono" id="cfg-path-hint">n/a</span></p>
       </div>
 
       <div id="running-banner" class="banner-start hidden" style="border-color: rgba(93,190,138,.35); background: linear-gradient(135deg, rgba(93,190,138,.12), rgba(28,38,56,.9));">
@@ -420,7 +423,7 @@
               <p class="muted" style="margin:.35rem 0 0">Live snapshot from the server. Mempool and worker counts move while P2P is running.</p>
             </div>
             <div class="dash-meta" id="dash-meta">
-              <span id="dash-updated">—</span><br/>
+              <span id="dash-updated">n/a</span><br/>
               <span>Poll <strong>~4s</strong> · mempool = unique txids on the wire</span>
             </div>
           </div>
@@ -518,12 +521,16 @@
 
       <section id="panel-security" class="panel">
         <div class="card">
-          <h2>API IP access</h2>
-          <p class="muted">When the list is <strong>empty</strong>, all IPs may call <span class="mono">/api/*</span> and <span class="mono">/track/*</span>. When you add entries, only matching IPv4/IPv6 addresses or CIDR ranges can use those paths (this page still loads; include <span class="mono">127.0.0.1</span> for local dashboard refresh). Behind a reverse proxy, set env <span class="mono">MTR_TRUST_XFF=1</span> on the server — see README.</p>
+          <h2>API access (IPs + token)</h2>
+          <p class="muted">When the IP list is <strong>empty</strong>, any IP may call <span class="mono">/api/*</span> and <span class="mono">/track/*</span> unless you rely on a token URL. When you add IP entries, only matching addresses/CIDRs can use those paths <em>without</em> a token (this page still loads; include <span class="mono">127.0.0.1</span> for local dashboard refresh). Behind a reverse proxy, set env <span class="mono">MTR_TRUST_XFF=1</span> - see README.</p>
+          <p class="muted">Optional <strong>API token</strong>: with a token configured, automation can call <span class="mono">/{token}/track/YourP2PKH</span> (and <span class="mono">/{token}/api/...</span>) from any IP. Requests that omit the token still use the IP allowlist rules.</p>
           <form id="form-allowlist">
             <label>Allowed IPs / CIDRs (one per line)</label>
             <textarea class="code" id="allowlist-text" name="allowlist" rows="5" placeholder="127.0.0.1&#10;10.0.0.0/8"></textarea>
-            <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">vpn_key</span><span>Save API allowlist</span></button>
+            <label>API access token (optional)</label>
+            <input id="api-token" name="api_token" type="text" placeholder="e.g. my-secret-token"/>
+            <p class="muted" style="margin:0 0 .75rem;font-size:.78rem">Example: <span class="mono">http://YOUR_IP/my-secret-token/track/DAddress...</span>. Do not use reserved names like <span class="mono">api</span> or <span class="mono">track</span>. Leave empty to disable URL tokens. Env <span class="mono">MTR_API_TOKEN</span> overrides this on process start.</p>
+            <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">vpn_key</span><span>Save API access settings</span></button>
           </form>
         </div>
       </section>
@@ -531,9 +538,9 @@
       <section id="panel-help" class="panel">
         <div class="card help-block">
           <h2>How MemeTracker works</h2>
-          <p>MemeTracker connects to the Dogecoin P2P network, requests the mempool, and listens for transaction inventory and raw transactions. It does <strong>not</strong> sync the blockchain. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, time, and DOGE amount and stores it under your data directory.</p>
+          <p>MemeTracker connects to the Dogecoin P2P network, requests the mempool, and listens for transaction inventory and raw transactions. It also tracks a rolling <strong>~24 hour</strong> header window and scans new block bodies so a payment that reaches a miner without appearing in your mempool view can still be recorded. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, time, and DOGE amount and stores it under your data directory.</p>
           <h3>Dashboard</h3>
-          <p>Summary counters plus <strong>live trend charts</strong> (mempool visibility, connected workers, stored rows and tracked addresses) built from browser polling while you keep the dashboard open.</p>
+          <p>Summary counters plus <strong>live trend charts</strong> (mempool visibility, connected workers, stored rows and tracked addresses) built from browser polling while you keep the dashboard open. Header safeguard stats show tip hash/time, headers kept, blocks scanned, and payments first seen from blocks.</p>
           <h3>Start / Stop</h3>
           <p><strong>Start</strong> writes <span class="mono">memetracker_config.json</span> and launches workers. <strong>Stop</strong> signals workers to exit between connections (an active peer session may take a short while). A complete config file on disk can auto-start P2P when the process launches.</p>
           <h3>Configuration</h3>
@@ -542,10 +549,12 @@
           <p>Same as <span class="mono">GET|POST /track/{address}</span>. Keeps the address watched and bumps retention.</p>
           <h3>Tracked addresses / Transactions</h3>
           <p>On-disk mirror of what you are watching and what was detected. Removing an address deletes its file and tx history in the app.</p>
+          <h3>Header / block safeguard</h3>
+          <p>After handshake, workers send <span class="mono">sendheaders</span>, request <span class="mono">getheaders</span>, and <span class="mono">getdata</span> for new block hashes. Headers older than about 24 hours are dropped from memory. On connect, parents within that window can be walked back so recent history is covered. This is not a full chain sync; it is a tip-focused safety net for missed mempool relay.</p>
           <h3>Double-spend detection (mempool)</h3>
           <p>MemeTracker also checks transaction <strong>inputs</strong> while watching live mempool traffic. If two or more mempool transactions spend the same previous output (same <span class="mono">prev_txid:vout</span>), they are flagged as a conflict and shown with a red <strong>Double spent detected</strong> badge. This check is live-window only: once transactions disappear from the current mempool tracking window, they are no longer actively compared. The feature is intended for transactions related to watched payment addresses.</p>
           <h3>API access</h3>
-          <p>Optional IP allowlist for JSON/track endpoints (see section above).</p>
+          <p>Optional IP allowlist and optional URL access token for JSON/track endpoints (see section above).</p>
         </div>
         <div class="card help-block">
           <h2>HTTP API reference</h2>
@@ -554,21 +563,25 @@
           <pre><code>curl -s BASE/api/status
 curl -s BASE/healthz</code></pre>
           <h3>Start / Stop P2P</h3>
-          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1}"
+          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"api_token\":\"\"}"
 
 curl -s -X POST BASE/api/stop</code></pre>
           <h3>Runtime limits</h3>
           <pre><code>curl -s -X POST BASE/api/config -H "Content-Type: application/json" -d "{\"list_limit\":20,\"retention_days\":14}"</code></pre>
-          <h3>API allowlist</h3>
-          <pre><code>curl -s -X POST BASE/api/allowlist -H "Content-Type: application/json" -d "{\"api_allowed_ips\":[\"127.0.0.1\",\"10.0.0.0/24\"]}"</code></pre>
+          <h3>API allowlist + token</h3>
+          <pre><code>curl -s -X POST BASE/api/allowlist -H "Content-Type: application/json" -d "{\"api_allowed_ips\":[\"127.0.0.1\",\"10.0.0.0/24\"],\"api_token\":\"my-secret-token\"}"</code></pre>
           <h3>Track address</h3>
-          <pre><code>curl -s "BASE/track/YourP2PKHAddress"</code></pre>
+          <pre><code>curl -s "BASE/track/YourP2PKHAddress"
+curl -s "BASE/my-secret-token/track/YourP2PKHAddress"</code></pre>
+          <p class="muted">Token URL form: <span class="mono">BASE/{api_token}/track/...</span> and <span class="mono">BASE/{api_token}/api/...</span>. Valid token bypasses the IP allowlist. Without a token prefix, IP allowlist rules apply.</p>
           <h3>Double-spend flag in API data</h3>
           <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span> (<span class="mono">true</span>/<span class="mono">false</span>) so automation can detect conflicting mempool spends.</p>
+          <h3>Header safeguard in API data</h3>
+          <p>Object <span class="mono">header_safeguard</span> includes tip hash/time, headers kept, blocks scanned, and <span class="mono">confirmed_hits</span> (payments newly stored from block body scans).</p>
           <h3>Remove address / tx row</h3>
           <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
 curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
-          <p class="muted">All API responses are JSON unless noted. Errors include an <span class="mono">error</span> string. A complete <span class="mono">memetracker_config.json</span> shape is required for <span class="mono">/api/start</span>; you may include <span class="mono">api_allowed_ips</span> as an array of strings.</p>
+          <p class="muted">All API responses are JSON unless noted. Errors include an <span class="mono">error</span> string. A complete <span class="mono">memetracker_config.json</span> shape is required for <span class="mono">/api/start</span>; you may include <span class="mono">api_allowed_ips</span> and optional <span class="mono">api_token</span>.</p>
         </div>
       </section>
 
@@ -880,6 +893,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
     f.p2p_log.value = fc.p2p_log;
     var ips = fc.api_allowed_ips;
     f.api_allowed_ips_text.value = Array.isArray(ips) && ips.length ? ips.join("\n") : "";
+    f.api_token.value = fc.api_token || "";
   }
 
   async function refreshAll() {
@@ -892,21 +906,29 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       fillStartForm(st.full_config);
       var allow = (st.full_config && st.full_config.api_allowed_ips) || [];
       $("#allowlist-text").value = Array.isArray(allow) && allow.length ? allow.join("\n") : "";
+      $("#api-token").value = (st.full_config && st.full_config.api_token) || "";
 
       $("#dash-updated").textContent = "Updated " + new Date().toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
       var dash = $("#dash-stats");
       dash.innerHTML = "";
+      var hs = st.header_safeguard || {};
+      var tipLabel = hs.tip_hash ? String(hs.tip_hash).slice(0, 12) + "..." : "n/a";
+      var tipHint = hs.tip_time_utc ? ("Tip time " + hs.tip_time_utc) : "Waiting for headers/blocks while P2P runs.";
       var statRows = [
         { k: "P2P running", v: run ? "yes" : "no", hint: run ? "Workers rotate peers between sessions." : "Start from the banner or use a complete memetracker_config.json." },
         { k: "Tracked addresses", v: st.watched_addresses },
         { k: "Stored tx rows", v: st.stored_transaction_rows },
         { k: "Mempool (unique tx ids)", v: st.mempool_tx_count, hint: run ? "Relay visibility on current peer sessions." : "Starts counting when P2P is running." },
-        { k: "P2P workers connected", v: st.peers_connected_count, hint: run ? "Sessions with an open peer right now." : "—" }
+        { k: "P2P workers connected", v: st.peers_connected_count, hint: run ? "Sessions with an open peer right now." : "n/a" },
+        { k: "Header tip", v: tipLabel, hint: tipHint },
+        { k: "Headers kept (~24h)", v: hs.headers_kept != null ? hs.headers_kept : 0 },
+        { k: "Blocks scanned", v: hs.blocks_scanned != null ? hs.blocks_scanned : 0, hint: "Bodies scanned for watched payments." },
+        { k: "Confirmed via blocks", v: hs.confirmed_hits != null ? hs.confirmed_hits : 0, hint: "New rows stored from block scans (mempool miss safeguard)." }
       ];
       statRows.forEach(function(row) {
         var d = document.createElement("div");
         d.className = "stat";
-        var hint = row.hint && row.hint !== "—" ? '<div class="stat-rownote">' + escapeHtml(row.hint) + "</div>" : "";
+        var hint = row.hint && row.hint !== "n/a" ? '<div class="stat-rownote">' + escapeHtml(row.hint) + "</div>" : "";
         d.innerHTML = '<div class="statVAL">' + escapeHtml(String(row.v)) + '</div><div class="statLBL">' + escapeHtml(row.k) + "</div>" + hint;
         dash.appendChild(d);
       });
@@ -968,7 +990,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         var tr = document.createElement("tr");
         var pill = p.connected ? '<span class="pill">connected</span>' : '<span class="pill off">idle</span>';
         tr.innerHTML = '<td data-label="Worker">' + escapeHtml(String(p.worker_id)) + '</td>' +
-          '<td data-label="Peer" class="mono">' + escapeHtml(p.address || "—") + '</td>' +
+          '<td data-label="Peer" class="mono">' + escapeHtml(p.address || "n/a") + '</td>' +
           '<td data-label="Status">' + pill + '</td>' +
           '<td data-label="Updated">' + escapeHtml(p.updated) + '</td>';
         tp.appendChild(tr);
@@ -1040,7 +1062,8 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       p2p_port: parseInt(f.p2p_port.value, 10),
       p2p_parallel: parseInt(f.p2p_parallel.value, 10),
       p2p_log: parseInt(f.p2p_log.value, 10),
-      api_allowed_ips: parseIPList(f.api_allowed_ips_text.value || "")
+      api_allowed_ips: parseIPList(f.api_allowed_ips_text.value || ""),
+      api_token: (f.api_token.value || "").trim()
     };
     try {
       var r = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify(body) });
@@ -1103,13 +1126,14 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
   $("#form-allowlist").addEventListener("submit", async function(ev) {
     ev.preventDefault();
     var ips = parseIPList($("#allowlist-text").value || "");
+    var token = ($("#api-token").value || "").trim();
     try {
       await api("/api/allowlist", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_allowed_ips: ips })
+        body: JSON.stringify({ api_allowed_ips: ips, api_token: token })
       });
-      showFlash("API allowlist saved to memetracker_config.json.", true);
+      showFlash("API access settings saved to memetracker_config.json.", true);
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
   });

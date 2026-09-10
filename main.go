@@ -1,17 +1,18 @@
-// MemeTracker — Dogecoin mempool watcher (open source, MIT License; see LICENSE).
+// MemeTracker - Dogecoin mempool watcher (open source, MIT License; see LICENSE).
 //
 // Copyright (c) Paulo Vidal · https://x.com/inevitable360 · Dogecoin Foundation Dev
 //
-// MemeTracker connects to Dogecoin peers only to observe the relay mempool: after
-// handshake it sends the mempool message, then handles inv (requesting getdata only
-// for MSG_TX / witness-tx inventory types), tx, and ping. It does not sync blocks,
-// headers, or chain state—unlike monolithic SPV samples that also parse blocks.
+// MemeTracker connects to Dogecoin peers to observe the relay mempool (mempool /
+// inv / getdata / tx / ping) and also tracks a rolling ~24h header window with
+// block body scans as a safeguard when a payment reaches a miner without being
+// seen first in the mempool view.
 package main
 
 import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/binary"
 	"encoding/hex"
@@ -41,7 +42,7 @@ const (
 	MAGIC               = 0xC0C0C0C0
 	COMMAND_LEN         = 12
 	MSG_WITNESS_FLAG    = 1 << 30
-	MSG_TX              = 1 // inventory type for transactions (and MSG_TX|MSG_WITNESS_FLAG for segwit); never MSG_BLOCK
+	MSG_TX              = 1 // inventory type for transactions (and MSG_TX|MSG_WITNESS_FLAG for segwit)
 	NODE_NETWORK        = 1 << 0
 	NODE_WITNESS        = 1 << 3
 	GETDATA_BATCH       = 48
@@ -1295,7 +1296,7 @@ func (s *Store) metricsSnapshot() (watched int, totalTx int, latestPayment strin
 		}
 	}
 	if latestPayment == "" {
-		latestPayment = "—"
+		latestPayment = "n/a"
 	}
 	return
 }
@@ -1606,15 +1607,18 @@ func shufflePeerIPs(workerID int, ips []string) []string {
 // mempoolSniffer runs several parallel P2P sessions (like the arcade pup rotating seeds/peers)
 // so inv/getdata gossip reaches MemeTracker faster and more reliably than a single connection.
 // Closing stop unblocks workers between peers (active sessions may finish naturally up to SESSION_SEC).
-func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, processed *ProcessedSet, parallel int, stop <-chan struct{}) {
+func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, parallel int, stop <-chan struct{}) {
 	if parallel < 1 {
 		parallel = 1
 	}
 	if parallel > 8 {
 		parallel = 8
 	}
+	if htrack == nil {
+		htrack = NewHeaderTracker()
+	}
 	for w := 0; w < parallel; w++ {
-		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, processed, stop)
+		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, stop)
 	}
 }
 
@@ -1627,7 +1631,7 @@ func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {
 	}
 }
 
-func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, processed *ProcessedSet, stop <-chan struct{}) {
+func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, stop <-chan struct{}) {
 	seeds, defaultPort := chooseSeeds(network)
 	if p2pPort == 0 {
 		p2pPort = defaultPort
@@ -1694,7 +1698,7 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 
 			stateLastPeer := net.JoinHostPort(peer, strconv.Itoa(p2pPort))
 			mcol.SetPeerSession(workerID, stateLastPeer, true)
-			memetrackerP2PSession(conn, stateLastPeer, store, processed, mcol, p2pPort, logf, logv)
+			memetrackerP2PSession(conn, stateLastPeer, store, processed, mcol, htrack, p2pPort, logf, logv)
 			mcol.SetPeerSession(workerID, stateLastPeer, false)
 			_ = conn.Close()
 		}
@@ -1705,17 +1709,194 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 	}
 }
 
-func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, p2pPort int, logf, logv func(string, ...any)) {
+// considerWatchedPayment matches outputs against watched addresses and stores hits.
+// When fromMempool is true, double-spend tracking runs on inputs.
+// Returns how many new address rows were inserted.
+func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *MetricsCollector, raw []byte, fromMempool bool, logf, logv func(string, ...any)) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	store.mu.RLock()
+	hasWatchers := len(store.watchByHash) > 0
+	store.mu.RUnlock()
+	if !hasWatchers {
+		return 0
+	}
+
+	outs, _, err := parseTxOutputs(raw)
+	if err != nil {
+		logv("parse tx failed: %v", err)
+		return 0
+	}
+	txid := txidHex(raw)
+	wtxid := wtxidHex(raw)
+	if processed.Has(txid) || processed.Has(wtxid) {
+		return 0
+	}
+
+	amtByHash := make(map[string]int64)
+	store.mu.RLock()
+	for _, o := range outs {
+		h160, ok := scriptPubKeyHash160(o.script)
+		if !ok {
+			continue
+		}
+		hashHex := hex.EncodeToString(h160)
+		if _, watching := store.watchByHash[hashHex]; watching {
+			amtByHash[hashHex] += o.valueSats
+		}
+	}
+	store.mu.RUnlock()
+	if len(amtByHash) == 0 {
+		return 0
+	}
+
+	isDoubleSpent := false
+	if fromMempool {
+		inputs, inErr := parseTxInputOutpoints(raw)
+		if inErr != nil {
+			logv("tx %s input parse failed for double-spend detection: %v", txid, inErr)
+		}
+		conflictedTxids := mcol.registerTrackedTxInputs(txid, inputs)
+		isDoubleSpent = len(conflictedTxids) > 0 || mcol.isDoubleSpent(txid)
+		if len(conflictedTxids) > 0 {
+			for _, cTxid := range conflictedTxids {
+				_ = store.MarkTxDoubleSpent(cTxid)
+			}
+		}
+	}
+
+	dt := time.Now().UTC()
+	inserted := 0
+	for hashHex, sats := range amtByHash {
+		if sats <= 0 {
+			continue
+		}
+		amountDoge := float64(sats) / 1e8
+		if store.AddTx(hashHex, txid, dt, amountDoge, isDoubleSpent) {
+			inserted++
+			addr, cbURL, ok := store.CallbackTarget(hashHex)
+			if ok && cbURL != "" {
+				go notifyCallback(cbURL, PaymentCallbackPayload{
+					Address:    addr,
+					Txid:       txid,
+					AmountDoge: amountDoge,
+					Datetime:   dt.Format(time.RFC3339),
+				})
+			}
+		}
+	}
+	if inserted > 0 {
+		processed.Add(txid)
+		processed.Add(wtxid)
+		logf("tx matched watched address(es) txid=%s inserted=%d mempool=%v", txid, inserted, fromMempool)
+	}
+	return inserted
+}
+
+func sendGetHeaders(conn net.Conn, htrack *HeaderTracker, logf, logv func(string, ...any)) error {
+	loc := htrack.LocatorHashes(101)
+	pl := buildGetHeadersPayload(loc)
+	msg := buildMessage("getheaders", pl)
+	_, err := conn.Write(msg)
+	if err != nil {
+		return err
+	}
+	logv("sent GETHEADERS locator_n=%d", len(loc))
+	return nil
+}
+
+func queueBlockFetches(conn net.Conn, htrack *HeaderTracker, hashHexes []string, logf, logv func(string, ...any)) error {
+	pending := make([]string, 0, MAX_BLOCK_FETCH_INV)
+	for _, hx := range hashHexes {
+		if !htrack.NeedBlock(hx) {
+			continue
+		}
+		if !htrack.MarkPending(hx) {
+			continue
+		}
+		pending = append(pending, hx)
+		if len(pending) >= MAX_BLOCK_FETCH_INV {
+			break
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	pl := buildBlockGetdata(pending)
+	if len(pl) == 0 {
+		for _, hx := range pending {
+			htrack.ClearPending(hx)
+		}
+		return nil
+	}
+	if _, err := conn.Write(buildMessage("getdata", pl)); err != nil {
+		for _, hx := range pending {
+			htrack.ClearPending(hx)
+		}
+		return err
+	}
+	logf("getdata blocks n=%d", len(pending))
+	return nil
+}
+
+func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, payload []byte, logf, logv func(string, ...any)) []string {
+	if len(payload) < 80 {
+		return nil
+	}
+	h80 := payload[:80]
+	hashHex, _ := htrack.RememberHeader80(h80)
+	if hashHex == "" {
+		return nil
+	}
+	if htrack.AlreadyScanned(hashHex) {
+		htrack.ClearPending(hashHex)
+		return nil
+	}
+	hits := 0
+	err := forEachBlockTxRaw(payload, func(idx int, txRaw []byte) error {
+		if idx == 0 {
+			return nil // skip coinbase
+		}
+		n := considerWatchedPayment(store, processed, mcol, txRaw, false, logf, logv)
+		hits += n
+		return nil
+	})
+	if err != nil {
+		logf("block scan failed hash=%s err=%v", hashHex, err)
+		htrack.ClearPending(hashHex)
+		return nil
+	}
+	htrack.MarkScanned(hashHex)
+	if hits > 0 {
+		htrack.AddConfirmedHits(hits)
+		logf("block safeguard matched payments hash=%s hits=%d", hashHex, hits)
+	} else {
+		logv("block scanned hash=%s no new watched payments", hashHex)
+	}
+	var want []string
+	if parent := htrack.ParentToBackfill(); parent != "" {
+		want = append(want, parent)
+	}
+	return want
+}
+
+func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, p2pPort int, logf, logv func(string, ...any)) {
+	if htrack == nil {
+		htrack = NewHeaderTracker()
+	}
 	gotVerack := false
 	mempoolSent := false
+	headersEnabled := false
 	lastMempoolResync := time.Time{}
+	lastGetHeaders := time.Time{}
 	start := time.Now()
-	var sessionExit error // set on non-timeout read/write failure or bad checksum
+	var sessionExit error
 
 	logf("connected peer=%s handshake start (Dogecoin P2P magic_u32le=0x%x wire_magic_4b_le_hex=%s)", stateLastPeer, MAGIC, dogeMagicWireHexLE())
 	verOut := buildVersionPayload(p2pPort)
 	verMsg := buildMessage("version", verOut)
-	logf("sending VERSION cmd payload_len=%d total_msg_bytes=%d — %s", len(verOut), len(verMsg), summarizeOutgoingVersionPayload(verOut, p2pPort))
+	logf("sending VERSION cmd payload_len=%d total_msg_bytes=%d - %s", len(verOut), len(verMsg), summarizeOutgoingVersionPayload(verOut, p2pPort))
 	logv("outgoing version raw payload hex (first 128b)=%s", hexSnippet(verOut, 128))
 	logv("message framing: all header fields little-endian except command is 12-byte ASCII null-padded; payload length u32le; checksum=first4bytes(sha256(sha256(payload)))")
 
@@ -1729,15 +1910,33 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 	}
 	logv("wrote version message ok")
 
+	maybeHeaderMaintenance := func() error {
+		if !gotVerack || !headersEnabled {
+			return nil
+		}
+		if parent := htrack.ParentToBackfill(); parent != "" {
+			if err := queueBlockFetches(conn, htrack, []string{parent}, logf, logv); err != nil {
+				return err
+			}
+		}
+		if time.Since(lastGetHeaders) >= time.Duration(GETHEADERS_TOPUP_SEC)*time.Second {
+			if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
+				return err
+			}
+			lastGetHeaders = time.Now()
+		}
+		return nil
+	}
+
 readLoop:
-	// Compare to time.Duration seconds — bare SESSION_SEC (300) is converted to 300ns, not 300s.
+	// Compare to time.Duration seconds - bare SESSION_SEC (300) is converted to 300ns, not 300s.
 	for time.Since(start) < time.Duration(SESSION_SEC)*time.Second {
 		_ = conn.SetReadDeadline(time.Now().Add(P2P_READ_IDLE_SEC * time.Second))
 		header, err := readExact(conn, 24)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				_ = conn.SetReadDeadline(time.Time{})
-				logv("read deadline (%ds idle) no header yet — gotVerack=%v mempoolSent=%v", P2P_READ_IDLE_SEC, gotVerack, mempoolSent)
+				logv("read deadline (%ds idle) no header yet - gotVerack=%v mempoolSent=%v", P2P_READ_IDLE_SEC, gotVerack, mempoolSent)
 				if gotVerack && mempoolSent {
 					if store.takeMempoolKick() {
 						_, _ = conn.Write(buildMessage("mempool", nil))
@@ -1754,6 +1953,10 @@ readLoop:
 						lastMempoolResync = time.Now()
 						logf("mempool periodic watchers=%d interval=%ds", nw, interval)
 					}
+				}
+				if err := maybeHeaderMaintenance(); err != nil {
+					sessionExit = err
+					break readLoop
 				}
 				continue
 			}
@@ -1774,7 +1977,7 @@ readLoop:
 			magic, cmd, size, chkWire, hex.EncodeToString(cmdRaw))
 
 		if magic != uint32(MAGIC) {
-			logf("wrong magic peer=%s got_u32le=0x%x want_u32le=0x%x (LE bytes got_hex=%s want_hex=%s) — skipping 24b, stream may be misaligned (TLS/wrong chain?)",
+			logf("wrong magic peer=%s got_u32le=0x%x want_u32le=0x%x (LE bytes got_hex=%s want_hex=%s) - skipping 24b, stream may be misaligned (TLS/wrong chain?)",
 				stateLastPeer, magic, MAGIC, hex.EncodeToString(header[0:4]), dogeMagicWireHexLE())
 			logv("full_header24_hex=%s", hex.EncodeToString(header))
 			continue
@@ -1802,7 +2005,7 @@ readLoop:
 		wantSum := hash2[:4]
 		if !bytes.Equal(chkWire, wantSum) {
 			sessionExit = fmt.Errorf("checksum mismatch")
-			logf("P2P checksum mismatch peer=%s cmd=%s payload_len=%d wire_checksum4=%x computed_double_sha256_4=%x — closing",
+			logf("P2P checksum mismatch peer=%s cmd=%s payload_len=%d wire_checksum4=%x computed_double_sha256_4=%x - closing",
 				stateLastPeer, cmd, len(payload), chkWire, wantSum)
 			logv("payload_head_hex=%s", hexSnippet(payload, 256))
 			break readLoop
@@ -1811,7 +2014,7 @@ readLoop:
 
 		switch cmd {
 		case "version":
-			logf("recv VERSION from peer=%s — %s", stateLastPeer, summarizePeerVersionPayload(payload))
+			logf("recv VERSION from peer=%s - %s", stateLastPeer, summarizePeerVersionPayload(payload))
 			logv("peer version payload head hex=%s", hexSnippet(payload, 256))
 			ack := buildMessage("verack", nil)
 			_, werr := conn.Write(ack)
@@ -1824,7 +2027,21 @@ readLoop:
 			logv("verack message hex=%s", hex.EncodeToString(ack))
 		case "verack":
 			gotVerack = true
-			logf("recv VERACK from peer=%s — handshake version negotiation complete (little-endian fields were already validated on VERSION)", stateLastPeer)
+			logf("recv VERACK from peer=%s - handshake complete", stateLastPeer)
+			if !headersEnabled {
+				if _, werr := conn.Write(buildMessage("sendheaders", nil)); werr != nil {
+					sessionExit = werr
+					logf("write sendheaders failed: %v", werr)
+					break readLoop
+				}
+				headersEnabled = true
+				logf("sent SENDHEADERS (realtime tip headers)")
+				if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
+					sessionExit = err
+					break readLoop
+				}
+				lastGetHeaders = time.Now()
+			}
 			if !mempoolSent {
 				mem := buildMessage("mempool", nil)
 				_, werr := conn.Write(mem)
@@ -1835,7 +2052,7 @@ readLoop:
 				}
 				mempoolSent = true
 				lastMempoolResync = time.Now()
-				logf("sent MEMPOOL request to peer=%s (%d bytes) — expecting inv/tx for relayed txs", stateLastPeer, len(mem))
+				logf("sent MEMPOOL request to peer=%s (%d bytes) - expecting inv/tx for relayed txs", stateLastPeer, len(mem))
 				logv("mempool msg hex=%s", hex.EncodeToString(mem))
 			}
 		case "ping":
@@ -1852,83 +2069,43 @@ readLoop:
 			txidEarly := txidHex(payload)
 			mcol.observeMempoolTxid(txidEarly)
 			logv("recv TX raw len=%d txid_le=%s", len(payload), txidEarly)
+			_ = considerWatchedPayment(store, processed, mcol, payload, true, logf, logv)
 
-			store.mu.RLock()
-			hasWatchers := len(store.watchByHash) > 0
-			store.mu.RUnlock()
-			if !hasWatchers {
-				logv("tx %s ignored (no watched addresses)", txidEarly)
-				continue
-			}
-
-			outs, _, err := parseTxOutputs(payload)
+		case "headers":
+			hdrs, err := decodeHeadersPayload(payload)
 			if err != nil {
-				log.Printf("[MTR-P2P] parse tx %s: %v", txidEarly, err)
+				logf("headers parse error peer=%s: %v", stateLastPeer, err)
 				continue
 			}
-			txid := txidHex(payload)
-			wtxid := wtxidHex(payload)
-
-			if processed.Has(txid) || processed.Has(wtxid) {
-				continue
-			}
-
-			amtByHash := make(map[string]int64)
-			store.mu.RLock()
-			for _, o := range outs {
-				h160, ok := scriptPubKeyHash160(o.script)
-				if !ok {
-					continue
-				}
-				hashHex := hex.EncodeToString(h160)
-				if _, watching := store.watchByHash[hashHex]; watching {
-					amtByHash[hashHex] += o.valueSats
+			logf("recv HEADERS peer=%s count=%d", stateLastPeer, len(hdrs))
+			want := make([]string, 0, len(hdrs))
+			for _, h80 := range hdrs {
+				hx, _ := htrack.RememberHeader80(h80)
+				if hx != "" && htrack.NeedBlock(hx) {
+					want = append(want, hx)
 				}
 			}
-			store.mu.RUnlock()
-
-			if len(amtByHash) == 0 {
-				continue
+			if err := queueBlockFetches(conn, htrack, want, logf, logv); err != nil {
+				sessionExit = err
+				break readLoop
 			}
-
-			inputs, inErr := parseTxInputOutpoints(payload)
-			if inErr != nil {
-				logv("tx %s input parse failed for double-spend detection: %v", txid, inErr)
-			}
-			conflictedTxids := mcol.registerTrackedTxInputs(txid, inputs)
-			isDoubleSpent := len(conflictedTxids) > 0 || mcol.isDoubleSpent(txid)
-			if len(conflictedTxids) > 0 {
-				for _, cTxid := range conflictedTxids {
-					_ = store.MarkTxDoubleSpent(cTxid)
-				}
-			}
-
-			dt := time.Now().UTC()
-			matchedAny := false
-			for hashHex, sats := range amtByHash {
-				if sats <= 0 {
-					continue
-				}
-				amountDoge := float64(sats) / 1e8
-				if store.AddTx(hashHex, txid, dt, amountDoge, isDoubleSpent) {
-					matchedAny = true
-					addr, cbURL, ok := store.CallbackTarget(hashHex)
-					if ok && cbURL != "" {
-						go notifyCallback(cbURL, PaymentCallbackPayload{
-							Address:    addr,
-							Txid:       txid,
-							AmountDoge: amountDoge,
-							Datetime:   dt.Format(time.RFC3339),
-						})
+			if len(hdrs) > 0 {
+				lastGetHeaders = time.Now()
+				if len(hdrs) >= 2000 {
+					if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
+						sessionExit = err
+						break readLoop
 					}
+					lastGetHeaders = time.Now()
 				}
 			}
-			if matchedAny {
-				processed.Add(txid)
-				processed.Add(wtxid)
-				logf("tx matched watched address(es) peer=%s txid=%s", stateLastPeer, txid)
-			} else {
-				logv("tx %s had watched outputs but nothing new stored (e.g. duplicate)", txid)
+
+		case "block":
+			logv("recv BLOCK payload_len=%d", len(payload))
+			wantParents := handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
+			if err := queueBlockFetches(conn, htrack, wantParents, logf, logv); err != nil {
+				sessionExit = err
+				break readLoop
 			}
 
 		case "inv":
@@ -1947,19 +2124,24 @@ readLoop:
 				continue
 			}
 			txLike := 0
+			blockLike := 0
+			blockHashes := make([]string, 0)
 			for _, it := range invs {
 				if invTypeIsTx(it.invType) {
 					txLike++
-				}
-			}
-			logf("recv INV peer=%s entries=%d tx_like=%d (inv vector: type u32le + hash 32 bytes wire order per entry; hash is internal byte order)",
-				stateLastPeer, len(invs), txLike)
-			logv("inv payload_len=%d parse_ok entries=%d", len(payload), len(invs))
-
-			for _, it := range invs {
-				if invTypeIsTx(it.invType) {
 					mcol.observeMempoolTxid(reverseBytesToHex(it.hash))
 				}
+				if invTypeIsBlock(it.invType) {
+					blockLike++
+					blockHashes = append(blockHashes, reverseBytesToHex(it.hash))
+				}
+			}
+			logf("recv INV peer=%s entries=%d tx_like=%d block_like=%d", stateLastPeer, len(invs), txLike, blockLike)
+			logv("inv payload_len=%d parse_ok entries=%d", len(payload), len(invs))
+
+			if err := queueBlockFetches(conn, htrack, blockHashes, logf, logv); err != nil {
+				sessionExit = err
+				break readLoop
 			}
 
 			store.mu.RLock()
@@ -1969,7 +2151,6 @@ readLoop:
 				continue
 			}
 
-			// Same strategy as arcade/server.py: getdata all new tx invs (dedupe by inv type+hash), not only when already seen as txid.
 			fetch := make([]invItem, 0, MAX_TX_FETCH_INV)
 			invSeen := make(map[string]struct{})
 			for _, it := range invs {
@@ -2015,8 +2196,7 @@ readLoop:
 			}
 
 		default:
-			logf("recv cmd=%q peer=%s payload_len=%d (magic+checksum validated; not handled in switch)", cmd, stateLastPeer, len(payload))
-			logv("unhandled payload head hex=%s", hexSnippet(payload, 128))
+			logv("recv cmd=%q peer=%s payload_len=%d (not handled)", cmd, stateLastPeer, len(payload))
 		}
 
 		if gotVerack && mempoolSent {
@@ -2035,6 +2215,10 @@ readLoop:
 				lastMempoolResync = time.Now()
 				logv("periodic MEMPOOL resent interval=%ds watchers=%d", interval, nw)
 			}
+		}
+		if err := maybeHeaderMaintenance(); err != nil {
+			sessionExit = err
+			break readLoop
 		}
 	}
 
@@ -2156,6 +2340,7 @@ type MemeTrackerConfig struct {
 	P2PParallel    int      `json:"p2p_parallel"`
 	P2PLog         int      `json:"p2p_log"`
 	APIAllowedIPs  []string `json:"api_allowed_ips,omitempty"` // empty or omitted = allow all IPs on /api/* and /track/*
+	APIToken       string   `json:"api_token,omitempty"`        // optional; enables /{token}/api/* and /{token}/track/*
 }
 
 func (c *MemeTrackerConfig) ApplyDefaults() {
@@ -2226,6 +2411,48 @@ func normalizeAPIAllowedIPs(in []string) []string {
 	return out
 }
 
+func normalizeAPIToken(s string) string {
+	return strings.TrimSpace(s)
+}
+
+func validateAPIToken(s string) error {
+	s = normalizeAPIToken(s)
+	if s == "" {
+		return nil
+	}
+	if strings.ContainsAny(s, "/?#") {
+		return errors.New("api_token must not contain /, ?, or #")
+	}
+	switch strings.ToLower(s) {
+	case "api", "track", "healthz", "logo.png", "static":
+		return errors.New("api_token cannot be a reserved path name (api, track, healthz, logo.png)")
+	}
+	return nil
+}
+
+// stripAPITokenPrefix returns the path after /{token} when the first path segment matches token.
+func stripAPITokenPrefix(path, token string) (string, bool) {
+	token = normalizeAPIToken(token)
+	if token == "" {
+		return path, false
+	}
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	rest := strings.TrimPrefix(path, "/")
+	seg, after, found := strings.Cut(rest, "/")
+	if subtle.ConstantTimeCompare([]byte(seg), []byte(token)) != 1 {
+		return path, false
+	}
+	if !found {
+		return "/", true
+	}
+	return "/" + after, true
+}
+
 // clientIPForAPI returns the client address for access control.
 // Set MTR_TRUST_XFF=1 to use the first hop in X-Forwarded-For (only behind a trusted reverse proxy).
 func clientIPForAPI(r *http.Request) string {
@@ -2286,17 +2513,30 @@ func apiPathNeedsIPCheck(path string) bool {
 
 func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := app.snapshotCfg()
+		token := normalizeAPIToken(cfg.APIToken)
+
+		// Optional URL token: /{token}/track/... or /{token}/api/...
+		// When present and valid, skip IP allowlist and rewrite to the real path.
+		if token != "" {
+			if newPath, ok := stripAPITokenPrefix(r.URL.Path, token); ok {
+				r2 := r.Clone(r.Context())
+				r2.URL.Path = newPath
+				next.ServeHTTP(w, r2)
+				return
+			}
+		}
+
 		if !apiPathNeedsIPCheck(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		cfg := app.snapshotCfg()
 		cl := clientIPForAPI(r)
 		if cl == "" {
 			cl = "unknown"
 		}
 		if !ipAllowedForAPI(cl, cfg.APIAllowedIPs) {
-			writeJSONError(w, http.StatusForbidden, fmt.Sprintf("API access denied for IP %s; add this address or your subnet (CIDR) to api_allowed_ips in memetracker_config.json or the API access screen, or clear the list to allow all", cl))
+			writeJSONError(w, http.StatusForbidden, fmt.Sprintf("API access denied for IP %s; use /{api_token}/... if configured, or add this address/CIDR to api_allowed_ips (or clear the list to allow all)", cl))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -2327,6 +2567,7 @@ type appState struct {
 	dataDir      string
 	store        *Store
 	mcol         *MetricsCollector
+	htrack       *HeaderTracker
 	processed    *ProcessedSet
 	settingsPath string
 	httpPort     int
@@ -2381,9 +2622,9 @@ func (a *appState) startP2P() {
 	cfg := a.snapshotCfg()
 	network := strings.ToLower(strings.TrimSpace(cfg.Network))
 	host := strings.TrimSpace(cfg.P2PHost)
-	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.processed, cfg.P2PParallel, stopCh)
+	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, cfg.P2PParallel, stopCh)
 	go runMetricsLoop(a.store, a.mcol, stopCh)
-	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d)", network, cfg.P2PParallel)
+	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=24h)", network, cfg.P2PParallel)
 }
 
 func (a *appState) stopP2P() {
@@ -2478,17 +2719,22 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 		allowCopy = []string{}
 	}
 	fc := map[string]any{
-		"http_port":        cfg.HTTPPort,
-		"http_bind":        cfg.HTTPBind,
-		"network":          cfg.Network,
-		"storage_dir":      app.dataDir,
-		"list_limit":       cfg.ListLimit,
-		"retention_days":   cfg.RetentionDays,
-		"p2p_host":         cfg.P2PHost,
-		"p2p_port":         cfg.P2PPort,
-		"p2p_parallel":     cfg.P2PParallel,
-		"p2p_log":          cfg.P2PLog,
-		"api_allowed_ips":  allowCopy,
+		"http_port":       cfg.HTTPPort,
+		"http_bind":       cfg.HTTPBind,
+		"network":         cfg.Network,
+		"storage_dir":     app.dataDir,
+		"list_limit":      cfg.ListLimit,
+		"retention_days":  cfg.RetentionDays,
+		"p2p_host":        cfg.P2PHost,
+		"p2p_port":        cfg.P2PPort,
+		"p2p_parallel":    cfg.P2PParallel,
+		"p2p_log":         cfg.P2PLog,
+		"api_allowed_ips": allowCopy,
+		"api_token":       cfg.APIToken,
+	}
+	hs := map[string]any{}
+	if app.htrack != nil {
+		hs = app.htrack.Snapshot()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"p2p_running":               app.isP2PRunning(),
@@ -2498,6 +2744,7 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 		"mempool_tx_count":          app.mcol.snapshot(),
 		"peers_connected_count":     nConn,
 		"peers":                     peerOut,
+		"header_safeguard":          hs,
 		"addresses":                 app.store.ListAddressSnapshots(),
 		"transactions":              app.store.FlattenTransactions(),
 		"full_config":               fc,
@@ -2603,6 +2850,11 @@ func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
 		return
 	}
 	body.APIAllowedIPs = normalizeAPIAllowedIPs(body.APIAllowedIPs)
+	body.APIToken = normalizeAPIToken(body.APIToken)
+	if err := validateAPIToken(body.APIToken); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	body.ApplyDefaults()
 	if !body.IsComplete() {
 		writeJSONError(w, http.StatusBadRequest, "incomplete configuration: need valid network (mainnet/testnet), ports, list_limit, retention_days, p2p_parallel 1–8")
@@ -2656,6 +2908,7 @@ func apiPostAllowlist(w http.ResponseWriter, r *http.Request, app *appState) {
 	}
 	var body struct {
 		APIAllowedIPs []string `json:"api_allowed_ips"`
+		APIToken      *string  `json:"api_token"` // optional; omit to leave unchanged, "" to clear
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json")
@@ -2664,13 +2917,26 @@ func apiPostAllowlist(w http.ResponseWriter, r *http.Request, app *appState) {
 	normalized := normalizeAPIAllowedIPs(body.APIAllowedIPs)
 	app.mu.Lock()
 	app.cfg.APIAllowedIPs = normalized
+	if body.APIToken != nil {
+		tok := normalizeAPIToken(*body.APIToken)
+		if err := validateAPIToken(tok); err != nil {
+			app.mu.Unlock()
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		app.cfg.APIToken = tok
+	}
 	cfgCopy := app.cfg
 	app.mu.Unlock()
 	if err := writeMemeTrackerConfigFile(app.configPath, &cfgCopy); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "api_allowed_ips": normalized})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"api_allowed_ips": normalized,
+		"api_token":       cfgCopy.APIToken,
+	})
 }
 
 func main() {
@@ -2765,6 +3031,7 @@ func main() {
 	}()
 
 	mcol := NewMetricsCollector(50000)
+	htrack := NewHeaderTracker()
 	processed := NewProcessedSet()
 
 	effectiveCfg := MemeTrackerConfig{
@@ -2782,6 +3049,17 @@ func main() {
 	effectiveCfg.ApplyDefaults()
 	if configFileRead {
 		effectiveCfg.APIAllowedIPs = normalizeAPIAllowedIPs(fileCfg.APIAllowedIPs)
+		effectiveCfg.APIToken = normalizeAPIToken(fileCfg.APIToken)
+		if err := validateAPIToken(effectiveCfg.APIToken); err != nil {
+			log.Printf("[MTR] warning: ignoring invalid api_token in config: %v", err)
+			effectiveCfg.APIToken = ""
+		}
+	}
+	if envTok := normalizeAPIToken(os.Getenv("MTR_API_TOKEN")); envTok != "" {
+		if err := validateAPIToken(envTok); err != nil {
+			log.Fatalf("invalid MTR_API_TOKEN: %v", err)
+		}
+		effectiveCfg.APIToken = envTok
 	}
 
 	diskComplete := false
@@ -2801,6 +3079,7 @@ func main() {
 		dataDir:      storageDir,
 		store:        store,
 		mcol:         mcol,
+		htrack:       htrack,
 		processed:    processed,
 		settingsPath: settingsPath,
 		httpPort:     publicPort,
