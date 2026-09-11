@@ -102,6 +102,15 @@ func envString(key, def string) string {
 	return mustEnvDefault(key, def)
 }
 
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // ------- Base58Check (P2PKH -> hash160) -------
 
 var b58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -1165,6 +1174,7 @@ func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge floa
 
 // NoteTxConfirmed marks a stored payment as included in a block and sets
 // confirmations from block height vs tip (capped at MAX_CONFIRMATIONS).
+// Returns true when a row newly became confirmed (was unconfirmed before).
 func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool {
 	if strings.TrimSpace(txid) == "" {
 		return false
@@ -1172,7 +1182,7 @@ func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool 
 	confs := confirmationsFromHeights(blockHeight, tipHeight)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	changed := false
+	newlyConfirmed := false
 	for _, ad := range s.watchByHash {
 		adChanged := false
 		for i := range ad.Txs {
@@ -1182,6 +1192,7 @@ func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool 
 			tx := &ad.Txs[i]
 			if !tx.Confirmed {
 				tx.Confirmed = true
+				newlyConfirmed = true
 				adChanged = true
 			}
 			if blockHeight >= 0 && (tx.BlockHeight <= 0 || tx.BlockHeight > blockHeight) {
@@ -1199,10 +1210,25 @@ func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool 
 		}
 		if adChanged {
 			_ = s.persistAddressLocked(ad)
-			changed = true
 		}
 	}
-	return changed
+	return newlyConfirmed
+}
+
+func (s *Store) KnowsTxid(txid string) bool {
+	if strings.TrimSpace(txid) == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, ad := range s.watchByHash {
+		for _, tx := range ad.Txs {
+			if tx.Txid == txid {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RefreshConfirmations updates confirmation counts for already-confirmed txs as tip advances.
@@ -2081,9 +2107,17 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 		blockH = tipH
 	}
 	hits := 0
+	confirmedNew := 0
 	err := forEachBlockTxRaw(payload, func(idx int, txRaw []byte) error {
 		if idx == 0 {
 			return nil // skip coinbase
+		}
+		txid := txidHex(txRaw)
+		// Confirm known mempool hits by txid even if output re-parse is skipped later.
+		if store.KnowsTxid(txid) {
+			if store.NoteTxConfirmed(txid, blockH, tipH) {
+				confirmedNew++
+			}
 		}
 		n := considerWatchedPayment(store, processed, mcol, txRaw, false, blockH, tipH, logf, logv)
 		hits += n
@@ -2095,11 +2129,11 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 		return nil
 	}
 	htrack.MarkScanned(hashHex)
-	if hits > 0 {
-		htrack.AddConfirmedHits(hits)
-		logf("block safeguard matched payments hash=%s hits=%d", hashHex, hits)
+	if hits > 0 || confirmedNew > 0 {
+		htrack.AddConfirmedHits(hits + confirmedNew)
+		logf("block safeguard hash=%s new_payments=%d newly_confirmed=%d", hashHex, hits, confirmedNew)
 	} else {
-		logv("block scanned hash=%s no new watched payments", hashHex)
+		logv("block scanned hash=%s no watched payment matches", hashHex)
 	}
 	// Do not chain-walk parent bodies here; mempool stays first, tip block is enough backup.
 	return nil
@@ -2448,9 +2482,18 @@ readLoop:
 				}
 			}
 
-			// Priority 2 (backup): tip block bodies only when mempool is quiet.
-			if txLike == 0 && !mempoolBusy() && len(blockHashes) > 0 {
-				if err := queueBlockFetches(conn, htrack, blockHashes, logf, logv); err != nil {
+			// Priority 2 (backup): always try one tip/new block body (mempool getdata already sent first).
+			if len(blockHashes) > 0 {
+				pick := blockHashes[len(blockHashes)-1]
+				if tip := htrack.TipHash(); tip != "" {
+					for _, bh := range blockHashes {
+						if bh == tip {
+							pick = tip
+							break
+						}
+					}
+				}
+				if err := queueBlockFetches(conn, htrack, []string{pick}, logf, logv); err != nil {
 					sessionExit = err
 					break readLoop
 				}
@@ -2600,8 +2643,11 @@ type MemeTrackerConfig struct {
 	P2PPort        int      `json:"p2p_port"`
 	P2PParallel    int      `json:"p2p_parallel"`
 	P2PLog         int      `json:"p2p_log"`
-	APIAllowedIPs  []string `json:"api_allowed_ips,omitempty"` // empty or omitted = allow all IPs on /api/* and /track/*
-	APIToken       string   `json:"api_token,omitempty"`        // optional; enables /{token}/api/* and /{token}/track/*
+	APIAllowedIPs  []string `json:"api_allowed_ips,omitempty"` // shared IP allowlist (full access when matched)
+	UserToken      string   `json:"user_token,omitempty"`       // user: /{token}/track/... and /{token}/healthz
+	AdminToken     string   `json:"admin_token,omitempty"`      // admin: web UI + /api/* + everything
+	// APIToken is a legacy alias for UserToken (read from older memetracker_config.json).
+	APIToken string `json:"api_token,omitempty"`
 }
 
 func (c *MemeTrackerConfig) ApplyDefaults() {
@@ -2634,6 +2680,14 @@ func (c *MemeTrackerConfig) ApplyDefaults() {
 	if c.P2PLog > 2 {
 		c.P2PLog = 2
 	}
+	// Migrate legacy api_token → user_token.
+	c.UserToken = normalizeAPIToken(c.UserToken)
+	c.APIToken = normalizeAPIToken(c.APIToken)
+	if c.UserToken == "" && c.APIToken != "" {
+		c.UserToken = c.APIToken
+	}
+	c.APIToken = "" // always persist as user_token going forward
+	c.AdminToken = normalizeAPIToken(c.AdminToken)
 }
 
 func (c *MemeTrackerConfig) IsComplete() bool {
@@ -2682,11 +2736,11 @@ func validateAPIToken(s string) error {
 		return nil
 	}
 	if strings.ContainsAny(s, "/?#") {
-		return errors.New("api_token must not contain /, ?, or #")
+		return errors.New("token must not contain /, ?, or #")
 	}
 	switch strings.ToLower(s) {
-	case "api", "track", "healthz", "logo.png", "static":
-		return errors.New("api_token cannot be a reserved path name (api, track, healthz, logo.png)")
+	case "api", "track", "healthz", "logo.png", "static", "admin":
+		return errors.New("token cannot be a reserved path name (api, track, healthz, logo.png, admin)")
 	}
 	return nil
 }
@@ -2780,59 +2834,47 @@ func requestWantsHTML(r *http.Request) bool {
 	return true
 }
 
-func serveAccessDenied(w http.ResponseWriter, r *http.Request, clientIP string, hasToken, hasIPRules bool) {
-	msg := fmt.Sprintf("API access denied for IP %s", clientIP)
-	if hasToken && hasIPRules {
-		msg += "; use an allowlisted IP or open /{api_token}/ (and /{api_token}/api/... or /{api_token}/track/...)"
-	} else if hasToken {
-		msg += "; open /{api_token}/ (and /{api_token}/api/... or /{api_token}/track/...)"
-	} else if hasIPRules {
-		msg += "; add this address/CIDR to api_allowed_ips (or clear the list to allow all)"
-	}
+func serveAccessDenied(w http.ResponseWriter, r *http.Request) {
 	if requestWantsHTML(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Access denied - MemeTracker</title>
+<title>Access denied</title>
 <style>
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
 font-family:"Comic Neue","Comic Sans MS",cursive,system-ui,sans-serif;background:#0c1018;color:#e8edf5;}
-.card{max-width:32rem;padding:1.5rem 1.75rem;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#151d2c;}
-h1{margin:0 0 .75rem;color:#e85d5d;font-size:1.35rem;}
-p{color:#8b9cb8;line-height:1.5;}
-code{color:#f2a900;word-break:break-all;}
-</style></head><body><div class="card">
-<h1>Access denied</h1>
-<p>This MemeTracker instance is restricted by client IP and/or a URL access token.</p>
-<p>`+htmlEscapeBasic(msg)+`</p>
-<p>If a token is configured, open <code>http://HOST/{token}/</code> in your browser. API calls use <code>/{token}/api/...</code> and <code>/{token}/track/...</code>.</p>
-</div></body></html>`)
+.card{max-width:24rem;padding:1.5rem 1.75rem;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#151d2c;text-align:center;}
+h1{margin:0;color:#e85d5d;font-size:1.35rem;}
+</style></head><body><div class="card"><h1>Access denied</h1></div></body></html>`)
 		return
 	}
-	writeJSONError(w, http.StatusForbidden, msg)
+	writeJSONError(w, http.StatusForbidden, "Access denied")
 }
 
-func htmlEscapeBasic(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, `"`, "&quot;")
-	return s
+func pathIsUserAllowed(path string) bool {
+	return strings.HasPrefix(path, "/track/") || path == "/healthz"
 }
 
 func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := app.snapshotCfg()
-		token := normalizeAPIToken(cfg.APIToken)
+		userTok := normalizeAPIToken(cfg.UserToken)
+		adminTok := normalizeAPIToken(cfg.AdminToken)
 		rules := normalizeAPIAllowedIPs(cfg.APIAllowedIPs)
-		hasToken := token != ""
 		hasIPRules := len(rules) > 0
+		hasUserTok := userTok != ""
+		hasAdminTok := adminTok != ""
 
-		// Valid URL token: /{token}/... bypasses IP allowlist and rewrites to the real path.
-		// Also supports /{token} and /{token}/ for the web UI.
-		if hasToken {
-			if newPath, ok := stripAPITokenPrefix(r.URL.Path, token); ok {
+		// No access controls configured: open.
+		if !hasIPRules && !hasUserTok && !hasAdminTok {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Admin token: everything (web UI, /api/*, /track/*, /healthz).
+		if hasAdminTok {
+			if newPath, ok := stripAPITokenPrefix(r.URL.Path, adminTok); ok {
 				r2 := r.Clone(r.Context())
 				r2.URL.Path = newPath
 				next.ServeHTTP(w, r2)
@@ -2840,42 +2882,31 @@ func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
 			}
 		}
 
-		// No restrictions configured: open access (legacy).
-		if !hasToken && !hasIPRules {
-			next.ServeHTTP(w, r)
-			return
+		// User token: /track/* and /healthz only.
+		if hasUserTok {
+			if newPath, ok := stripAPITokenPrefix(r.URL.Path, userTok); ok {
+				if pathIsUserAllowed(newPath) {
+					r2 := r.Clone(r.Context())
+					r2.URL.Path = newPath
+					next.ServeHTTP(w, r2)
+					return
+				}
+				serveAccessDenied(w, r)
+				return
+			}
 		}
 
-		// Keep health probes reachable when restricted.
-		if r.URL.Path == "/healthz" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
+		// Shared IP whitelist: full access (same as admin) without a token.
 		cl := clientIPForAPI(r)
 		if cl == "" {
 			cl = "unknown"
 		}
-
-		ipOK := hasIPRules && ipAllowedForAPI(cl, rules)
-		// Token-only: require token prefix (already handled above).
-		// IP-only: require allowlisted IP.
-		// Both: allowlisted IP OR token prefix.
-		allowed := false
-		if hasToken && hasIPRules {
-			allowed = ipOK
-		} else if hasIPRules {
-			allowed = ipOK
-		} else if hasToken {
-			allowed = false
-		}
-
-		if !allowed {
-			serveAccessDenied(w, r, cl, hasToken, hasIPRules)
+		if hasIPRules && ipAllowedForAPI(cl, rules) {
+			next.ServeHTTP(w, r)
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		serveAccessDenied(w, r)
 	})
 }
 
@@ -3066,7 +3097,8 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 		"p2p_parallel":    cfg.P2PParallel,
 		"p2p_log":         cfg.P2PLog,
 		"api_allowed_ips": allowCopy,
-		"api_token":       cfg.APIToken,
+		"user_token":      cfg.UserToken,
+		"admin_token":     cfg.AdminToken,
 	}
 	hs := map[string]any{}
 	if app.htrack != nil {
@@ -3216,12 +3248,19 @@ func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
 		return
 	}
 	body.APIAllowedIPs = normalizeAPIAllowedIPs(body.APIAllowedIPs)
-	body.APIToken = normalizeAPIToken(body.APIToken)
-	if err := validateAPIToken(body.APIToken); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+	body.ApplyDefaults() // migrates legacy api_token → user_token
+	if err := validateAPIToken(body.UserToken); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "user_token: "+err.Error())
 		return
 	}
-	body.ApplyDefaults()
+	if err := validateAPIToken(body.AdminToken); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "admin_token: "+err.Error())
+		return
+	}
+	if body.UserToken != "" && body.AdminToken != "" && subtle.ConstantTimeCompare([]byte(body.UserToken), []byte(body.AdminToken)) == 1 {
+		writeJSONError(w, http.StatusBadRequest, "user_token and admin_token must be different")
+		return
+	}
 	if !body.IsComplete() {
 		writeJSONError(w, http.StatusBadRequest, "incomplete configuration: need valid network (mainnet/testnet), ports, list_limit, retention_days, p2p_parallel 1–8")
 		return
@@ -3274,7 +3313,9 @@ func apiPostAllowlist(w http.ResponseWriter, r *http.Request, app *appState) {
 	}
 	var body struct {
 		APIAllowedIPs []string `json:"api_allowed_ips"`
-		APIToken      *string  `json:"api_token"` // optional; omit to leave unchanged, "" to clear
+		UserToken     *string  `json:"user_token"`  // user token; omit to leave unchanged, "" to clear
+		APIToken      *string  `json:"api_token"`   // legacy alias for user_token
+		AdminToken    *string  `json:"admin_token"` // admin token; omit to leave unchanged, "" to clear
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json")
@@ -3283,15 +3324,37 @@ func apiPostAllowlist(w http.ResponseWriter, r *http.Request, app *appState) {
 	normalized := normalizeAPIAllowedIPs(body.APIAllowedIPs)
 	app.mu.Lock()
 	app.cfg.APIAllowedIPs = normalized
-	if body.APIToken != nil {
-		tok := normalizeAPIToken(*body.APIToken)
+	var userPtr *string
+	if body.UserToken != nil {
+		userPtr = body.UserToken
+	} else if body.APIToken != nil {
+		userPtr = body.APIToken
+	}
+	if userPtr != nil {
+		tok := normalizeAPIToken(*userPtr)
 		if err := validateAPIToken(tok); err != nil {
 			app.mu.Unlock()
-			writeJSONError(w, http.StatusBadRequest, err.Error())
+			writeJSONError(w, http.StatusBadRequest, "user_token: "+err.Error())
 			return
 		}
-		app.cfg.APIToken = tok
+		app.cfg.UserToken = tok
 	}
+	if body.AdminToken != nil {
+		tok := normalizeAPIToken(*body.AdminToken)
+		if err := validateAPIToken(tok); err != nil {
+			app.mu.Unlock()
+			writeJSONError(w, http.StatusBadRequest, "admin_token: "+err.Error())
+			return
+		}
+		app.cfg.AdminToken = tok
+	}
+	if app.cfg.UserToken != "" && app.cfg.AdminToken != "" &&
+		subtle.ConstantTimeCompare([]byte(app.cfg.UserToken), []byte(app.cfg.AdminToken)) == 1 {
+		app.mu.Unlock()
+		writeJSONError(w, http.StatusBadRequest, "user_token and admin_token must be different")
+		return
+	}
+	app.cfg.APIToken = ""
 	cfgCopy := app.cfg
 	app.mu.Unlock()
 	if err := writeMemeTrackerConfigFile(app.configPath, &cfgCopy); err != nil {
@@ -3301,7 +3364,8 @@ func apiPostAllowlist(w http.ResponseWriter, r *http.Request, app *appState) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
 		"api_allowed_ips": normalized,
-		"api_token":       cfgCopy.APIToken,
+		"user_token":      cfgCopy.UserToken,
+		"admin_token":     cfgCopy.AdminToken,
 	})
 }
 
@@ -3418,17 +3482,34 @@ func main() {
 	effectiveCfg.ApplyDefaults()
 	if configFileRead {
 		effectiveCfg.APIAllowedIPs = normalizeAPIAllowedIPs(fileCfg.APIAllowedIPs)
-		effectiveCfg.APIToken = normalizeAPIToken(fileCfg.APIToken)
-		if err := validateAPIToken(effectiveCfg.APIToken); err != nil {
-			log.Printf("[MTR] warning: ignoring invalid api_token in config: %v", err)
-			effectiveCfg.APIToken = ""
+		fileCfg.ApplyDefaults() // migrates legacy api_token → user_token
+		effectiveCfg.UserToken = fileCfg.UserToken
+		effectiveCfg.AdminToken = fileCfg.AdminToken
+		if err := validateAPIToken(effectiveCfg.UserToken); err != nil {
+			log.Printf("[MTR] warning: ignoring invalid user_token in config: %v", err)
+			effectiveCfg.UserToken = ""
+		}
+		if err := validateAPIToken(effectiveCfg.AdminToken); err != nil {
+			log.Printf("[MTR] warning: ignoring invalid admin_token in config: %v", err)
+			effectiveCfg.AdminToken = ""
+		}
+		if effectiveCfg.UserToken != "" && effectiveCfg.AdminToken != "" &&
+			subtle.ConstantTimeCompare([]byte(effectiveCfg.UserToken), []byte(effectiveCfg.AdminToken)) == 1 {
+			log.Printf("[MTR] warning: user_token and admin_token were identical; clearing admin_token")
+			effectiveCfg.AdminToken = ""
 		}
 	}
-	if envTok := normalizeAPIToken(os.Getenv("MTR_API_TOKEN")); envTok != "" {
+	if envTok := normalizeAPIToken(firstNonEmpty(os.Getenv("MTR_USER_TOKEN"), os.Getenv("MTR_API_TOKEN"))); envTok != "" {
 		if err := validateAPIToken(envTok); err != nil {
-			log.Fatalf("invalid MTR_API_TOKEN: %v", err)
+			log.Fatalf("invalid user token env: %v", err)
 		}
-		effectiveCfg.APIToken = envTok
+		effectiveCfg.UserToken = envTok
+	}
+	if envAdmin := normalizeAPIToken(os.Getenv("MTR_ADMIN_TOKEN")); envAdmin != "" {
+		if err := validateAPIToken(envAdmin); err != nil {
+			log.Fatalf("invalid MTR_ADMIN_TOKEN: %v", err)
+		}
+		effectiveCfg.AdminToken = envAdmin
 	}
 
 	diskComplete := false
@@ -3463,14 +3544,13 @@ func main() {
 		apiPostAllowlist(w, r, app)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		ll, rd := app.store.Limits()
+		cfg := app.snapshotCfg()
+		_, nConn := app.mcol.snapshotPeers()
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":              true,
-			"server_time_utc": time.Now().UTC().Format(time.RFC3339),
-			"list_limit":      ll,
-			"retention_days":  rd,
-			"storage_dir":     app.dataDir,
-			"p2p_running":     app.isP2PRunning(),
+			"p2p_running":           app.isP2PRunning(),
+			"peers_connected_count": nConn,
+			"network":               strings.ToLower(cfg.Network),
 		})
 	})
 
@@ -3528,21 +3608,34 @@ func main() {
 		}
 
 		callbackURL := deriveCallbackURL(r, addr)
-		already, recents, appliedCallback, err := app.store.UpsertTracking(addr, hash160, callbackURL)
+		_, recents, _, err := app.store.UpsertTracking(addr, hash160, callbackURL)
 		if err != nil {
 			http.Error(w, "storage error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		ll, rd := app.store.Limits()
+		// Public track payload: confirmations only (0 = mempool / not yet in a block).
+		txs := make([]map[string]any, 0, len(recents))
+		for _, tx := range recents {
+			row := map[string]any{
+				"txid":          tx.Txid,
+				"datetime":      tx.Datetime,
+				"amount_doge":   tx.AmountDoge,
+				"double_spent":  tx.DoubleSpent,
+				"confirmations": clampConfirmations(tx.Confirmations),
+			}
+			if tx.BlockHeight != 0 {
+				row["block_height"] = tx.BlockHeight
+			}
+			txs = append(txs, row)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		resp := map[string]any{
-			"address":             addr,
-			"monitored":           true,
-			"already_monitoring":  already,
-			"callback_url":        appliedCallback,
-			"retention_days":      rd,
-			"stored_tx_limit":     ll,
-			"transactions":        recents,
+			"address":         addr,
+			"monitored":       true,
+			"retention_days":  rd,
+			"stored_tx_limit": ll,
+			"transactions":    txs,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})

@@ -267,6 +267,30 @@
     .msg { padding: .65rem .85rem; border-radius: 8px; margin: .5rem 0; font-size: .88rem; }
     .msg.ok { background: rgba(93,190,138,.12); border: 1px solid rgba(93,190,138,.35); }
     .msg.err { background: rgba(232,93,93,.12); border: 1px solid rgba(232,93,93,.35); }
+    .conf-pie {
+      --pie-size: 1.55rem;
+      width: var(--pie-size);
+      height: var(--pie-size);
+      display: inline-block;
+      flex-shrink: 0;
+      vertical-align: middle;
+    }
+    .conf-pie svg { width: 100%; height: 100%; display: block; }
+    .conf-pie .seg { fill: rgba(139,156,184,.35); transition: fill .25s ease; }
+    .conf-pie .seg.on { fill: var(--ok); }
+    .conf-pie-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: .45rem;
+      vertical-align: middle;
+    }
+    .conf-pie-label {
+      font-size: .72rem;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: .02em;
+    }
+    .conf-pie-wrap.is-confirmed .conf-pie-label { color: var(--ok); }
     .pill { display: inline-block; font-size: .68rem; font-weight: 600; padding: .15rem .4rem; border-radius: 999px; background: rgba(93,190,138,.2); color: var(--ok); }
     .pill.off { background: rgba(139,156,184,.2); color: var(--muted); }
     .pill.warn { background: rgba(232,93,93,.2); color: var(--danger); }
@@ -358,7 +382,7 @@
       <button type="button" data-tab="addr"><span class="material-icons side-nav-ico" aria-hidden="true">account_balance_wallet</span><span class="side-nav-label">Tracked addresses</span></button>
       <button type="button" data-tab="tx"><span class="material-icons side-nav-ico" aria-hidden="true">receipt_long</span><span class="side-nav-label">Transactions</span></button>
       <button type="button" data-tab="peers"><span class="material-icons side-nav-ico" aria-hidden="true">device_hub</span><span class="side-nav-label">Peers &amp; mempool</span></button>
-      <button type="button" data-tab="security"><span class="material-icons side-nav-ico" aria-hidden="true">shield</span><span class="side-nav-label">API access</span></button>
+      <button type="button" data-tab="security"><span class="material-icons side-nav-ico" aria-hidden="true">shield</span><span class="side-nav-label">Access control</span></button>
       <button type="button" data-tab="help"><span class="material-icons side-nav-ico" aria-hidden="true">menu_book</span><span class="side-nav-label">Help &amp; API docs</span></button>
     </nav>
   </aside>
@@ -398,12 +422,15 @@
             <div><label>P2P log level (0–2)</label><input name="p2p_log" type="number" min="0" max="2" required/></div>
           </div>
           <div style="grid-column:1/-1">
-            <label>API allowed IPs (optional)</label>
-            <textarea class="code" name="api_allowed_ips_text" rows="3" placeholder="One per line or comma-separated. Empty = allow all. Example:&#10;127.0.0.1&#10;192.168.1.0/24"></textarea>
-            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Restrict UI, <span class="mono">/api/*</span>, and <span class="mono">/track/*</span> by client IP when no URL token is used. Include <span class="mono">127.0.0.1</span> for local UI without a token.</p>
-            <label>API access token (optional)</label>
-            <input name="api_token" type="text" placeholder="empty = disabled; then use /{token}/ for UI and API"/>
-            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">When set, open <span class="mono">http://HOST/{token}/</span> for the dashboard (and <span class="mono">/{token}/api/...</span>, <span class="mono">/{token}/track/...</span>). Token bypasses the IP list. Behind a reverse proxy, set <span class="mono">MTR_TRUST_XFF=1</span>.</p>
+            <label>Allowed IPs (optional, shared)</label>
+            <textarea class="code" name="api_allowed_ips_text" rows="3" placeholder="One per line. Empty = no IP gate. Example:&#10;127.0.0.1&#10;10.0.0.0/8"></textarea>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Same whitelist for both levels. Matching IPs get full admin access without a token.</p>
+            <label>Admin token (web UI + everything)</label>
+            <input name="admin_token" type="text" placeholder="admin token"/>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Level 2: dashboard and <span class="mono">/api/*</span> via <span class="mono">/{admin_token}/</span>. Env <span class="mono">MTR_ADMIN_TOKEN</span>.</p>
+            <label>User token (/track + /healthz only)</label>
+            <input name="user_token" type="text" placeholder="user token"/>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Level 1: <span class="mono">/{user_token}/track/D...</span> and <span class="mono">/{user_token}/healthz</span>. Env <span class="mono">MTR_USER_TOKEN</span> (or legacy <span class="mono">MTR_API_TOKEN</span>).</p>
           </div>
           <p style="margin:1rem 0 .5rem"><button type="submit" class="btn btn-primary btn-with-icon" id="btn-start"><span class="material-icons" aria-hidden="true">play_arrow</span><span>Start MemeTracker</span></button></p>
         </form>
@@ -570,16 +597,23 @@
 
       <section id="panel-security" class="panel">
         <div class="card">
-          <h2>API access (IPs + token)</h2>
-          <p class="muted">When IP allowlist and/or API token are set, the <strong>web UI is restricted</strong> the same way as the API. Use an allowlisted IP, or open <span class="mono">http://HOST/{token}/</span> (the UI then calls <span class="mono">/{token}/api/...</span>). Without a matching IP or token you get Access denied.</p>
-          <p class="muted">Optional <strong>API token</strong>: automation can call <span class="mono">/{token}/track/YourP2PKH</span> and <span class="mono">/{token}/api/...</span> from any IP. Token-only mode (no IP list) requires the token prefix for UI and API.</p>
+          <h2>Access control</h2>
+          <p class="muted" style="margin:0 0 1rem">Two levels, optional shared IP whitelist:</p>
+          <ul class="muted" style="margin:0 0 1rem;padding-left:1.2rem;font-size:.88rem;line-height:1.55">
+            <li><strong>User</strong> - <span class="mono">/track/&#123;address&#125;</span> and <span class="mono">/healthz</span> only (user token)</li>
+            <li><strong>Admin</strong> - web UI + <span class="mono">/api/*</span> + everything (admin token)</li>
+            <li><strong>IP whitelist</strong> - same list for both; matching IPs get full admin access without a token</li>
+          </ul>
           <form id="form-allowlist">
-            <label>Allowed IPs / CIDRs (one per line)</label>
+            <label>Allowed IPs / CIDRs (shared)</label>
             <textarea class="code" id="allowlist-text" name="allowlist" rows="5" placeholder="127.0.0.1&#10;10.0.0.0/8"></textarea>
-            <label>API access token (optional)</label>
-            <input id="api-token" name="api_token" type="text" placeholder="e.g. my-secret-token"/>
-            <p class="muted" style="margin:0 0 .75rem;font-size:.78rem">Example: <span class="mono">http://YOUR_IP/my-secret-token/track/DAddress...</span>. Do not use reserved names like <span class="mono">api</span> or <span class="mono">track</span>. Leave empty to disable URL tokens. Env <span class="mono">MTR_API_TOKEN</span> overrides this on process start.</p>
-            <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">vpn_key</span><span>Save API access settings</span></button>
+            <label>Admin token</label>
+            <input id="admin-token" name="admin_token" type="text" placeholder="admin token for web UI and /api"/>
+            <p class="muted" style="margin:0 0 .75rem;font-size:.78rem"><span class="mono">http://HOST/{admin_token}/</span> · env <span class="mono">MTR_ADMIN_TOKEN</span></p>
+            <label>User token</label>
+            <input id="user-token" name="user_token" type="text" placeholder="user token for /track and /healthz"/>
+            <p class="muted" style="margin:0 0 .75rem;font-size:.78rem"><span class="mono">/{user_token}/track/D...</span> · <span class="mono">/{user_token}/healthz</span> · env <span class="mono">MTR_USER_TOKEN</span></p>
+            <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">vpn_key</span><span>Save access settings</span></button>
           </form>
         </div>
       </section>
@@ -602,27 +636,28 @@
           <p><strong>Backup only.</strong> Mempool watching always has priority. Workers track tip headers (<span class="mono">sendheaders</span> / <span class="mono">getheaders</span>), save the verified tip to <span class="mono">header_tip.json</span>, and only scan a recent tip block body when mempool traffic is quiet. That catches watched payments that skipped mempool relay and went straight into a block. This is not a full chain sync and must not starve mempool <span class="mono">getdata</span>.</p>
           <h3>Double-spend detection (mempool)</h3>
           <p>MemeTracker also checks transaction <strong>inputs</strong> while watching live mempool traffic. If two or more mempool transactions spend the same previous output (same <span class="mono">prev_txid:vout</span>), they are flagged as a conflict and shown with a red <strong>Double spent detected</strong> badge. This check is live-window only: once transactions disappear from the current mempool tracking window, they are no longer actively compared. The feature is intended for transactions related to watched payment addresses.</p>
-          <h3>API access</h3>
-          <p>Optional IP allowlist and optional URL access token for JSON/track endpoints (see section above).</p>
+          <h3>Access control</h3>
+          <p><strong>User token</strong>: <span class="mono">/track/&#123;address&#125;</span> and <span class="mono">/healthz</span>. <strong>Admin token</strong>: web UI and <span class="mono">/api/*</span>. Shared IP whitelist grants full access. Unauthorized = Access denied only.</p>
         </div>
         <div class="card help-block">
           <h2>HTTP API reference</h2>
           <p>Replace <code>BASE</code> with your server origin, e.g. <span class="mono">http://127.0.0.1:33555</span>.</p>
           <h3>Status &amp; health</h3>
-          <pre><code>curl -s BASE/api/status
-curl -s BASE/healthz</code></pre>
+          <pre><code>curl -s BASE/healthz
+curl -s BASE/{user_token}/healthz
+curl -s BASE/{admin_token}/api/status</code></pre>
           <h3>Start / Stop P2P</h3>
-          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"api_token\":\"\"}"
+          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"user_token\":\"\",\"admin_token\":\"\"}"
 
 curl -s -X POST BASE/api/stop</code></pre>
           <h3>Runtime limits</h3>
           <pre><code>curl -s -X POST BASE/api/config -H "Content-Type: application/json" -d "{\"list_limit\":20,\"retention_days\":14}"</code></pre>
-          <h3>API allowlist + token</h3>
-          <pre><code>curl -s -X POST BASE/api/allowlist -H "Content-Type: application/json" -d "{\"api_allowed_ips\":[\"127.0.0.1\",\"10.0.0.0/24\"],\"api_token\":\"my-secret-token\"}"</code></pre>
-          <h3>Track address</h3>
+          <h3>Access control</h3>
+          <pre><code>curl -s -X POST BASE/api/allowlist -H "Content-Type: application/json" -d "{\"api_allowed_ips\":[\"127.0.0.1\"],\"user_token\":\"user-token\",\"admin_token\":\"admin-token\"}"</code></pre>
+          <h3>Track address (user)</h3>
           <pre><code>curl -s "BASE/track/YourP2PKHAddress"
-curl -s "BASE/my-secret-token/track/YourP2PKHAddress"</code></pre>
-          <p class="muted">Token URL form: <span class="mono">BASE/{api_token}/track/...</span> and <span class="mono">BASE/{api_token}/api/...</span>. Valid token bypasses the IP allowlist. Without a token prefix, IP allowlist rules apply.</p>
+curl -s "BASE/{user_token}/track/YourP2PKHAddress"</code></pre>
+          <p class="muted">User token: <span class="mono">/track</span> + <span class="mono">/healthz</span>. Admin token: web UI + <span class="mono">/api</span>. Shared IP whitelist = full access.</p>
           <h3>Double-spend flag in API data</h3>
           <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span>, <span class="mono">confirmed</span>, and <span class="mono">confirmations</span> (0-5, from headers/blocks after inclusion).</p>
           <h3>Header safeguard in API data</h3>
@@ -630,7 +665,7 @@ curl -s "BASE/my-secret-token/track/YourP2PKHAddress"</code></pre>
           <h3>Remove address / tx row</h3>
           <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
 curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
-          <p class="muted">All API responses are JSON unless noted. Errors include an <span class="mono">error</span> string. A complete <span class="mono">memetracker_config.json</span> shape is required for <span class="mono">/api/start</span>; you may include <span class="mono">api_allowed_ips</span> and optional <span class="mono">api_token</span>.</p>
+          <p class="muted">All API responses are JSON unless noted. Errors include an <span class="mono">error</span> string. A complete <span class="mono">memetracker_config.json</span> shape is required for <span class="mono">/api/start</span>; you may include <span class="mono">api_allowed_ips</span>, <span class="mono">user_token</span>, and <span class="mono">admin_token</span>.</p>
         </div>
       </section>
 
@@ -825,13 +860,36 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
     return !!(form && ae && form.contains(ae));
   }
 
+  function confirmationPieSvg(n) {
+    // Five donut wedges (gap between slices). Gray by default; first n turn green.
+    var cx = 16, cy = 16, rOut = 14, rIn = 7.5, gap = 0.12; // gap in radians
+    var paths = [];
+    for (var i = 0; i < 5; i++) {
+      var a0 = -Math.PI / 2 + i * (Math.PI * 2 / 5) + gap / 2;
+      var a1 = -Math.PI / 2 + (i + 1) * (Math.PI * 2 / 5) - gap / 2;
+      var x0 = cx + rOut * Math.cos(a0), y0 = cy + rOut * Math.sin(a0);
+      var x1 = cx + rOut * Math.cos(a1), y1 = cy + rOut * Math.sin(a1);
+      var xi0 = cx + rIn * Math.cos(a1), yi0 = cy + rIn * Math.sin(a1);
+      var xi1 = cx + rIn * Math.cos(a0), yi1 = cy + rIn * Math.sin(a0);
+      var d = "M " + x0.toFixed(2) + " " + y0.toFixed(2) +
+        " A " + rOut + " " + rOut + " 0 0 1 " + x1.toFixed(2) + " " + y1.toFixed(2) +
+        " L " + xi0.toFixed(2) + " " + yi0.toFixed(2) +
+        " A " + rIn + " " + rIn + " 0 0 0 " + xi1.toFixed(2) + " " + yi1.toFixed(2) + " Z";
+      paths.push('<path class="seg' + (i < n ? " on" : "") + '" d="' + d + '"/>');
+    }
+    return '<svg viewBox="0 0 32 32" aria-hidden="true">' + paths.join("") + "</svg>";
+  }
+
   function fillAllowlistFields(fc) {
     var allow = (fc && fc.api_allowed_ips) || [];
-    var tok = (fc && fc.api_token) || "";
+    var tok = (fc && (fc.user_token || fc.api_token)) || "";
+    var adm = (fc && fc.admin_token) || "";
     var al = $("#allowlist-text");
-    var at = $("#api-token");
+    var at = $("#user-token");
+    var ad = $("#admin-token");
     if (al) al.value = Array.isArray(allow) && allow.length ? allow.join("\n") : "";
     if (at) at.value = tok;
+    if (ad) ad.value = adm;
   }
 
   function maybeFillConfigForms(st, settingsCfg) {
@@ -1124,7 +1182,8 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
     f.p2p_log.value = fc.p2p_log;
     var ips = fc.api_allowed_ips;
     f.api_allowed_ips_text.value = Array.isArray(ips) && ips.length ? ips.join("\n") : "";
-    f.api_token.value = fc.api_token || "";
+    if (f.user_token) f.user_token.value = fc.user_token || fc.api_token || "";
+    if (f.admin_token) f.admin_token.value = fc.admin_token || "";
   }
 
   async function refreshAll() {
@@ -1207,13 +1266,17 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         var tr = document.createElement("tr");
         var txidEsc = escapeHtml(tx.txid);
         var explore = sochainTxURL(tx.txid);
-        var dsBadge = tx.double_spent ? ' <span class="pill warn">Double spent detected</span>' : "";
         var confN = Number(tx.confirmations) || 0;
         if (confN < 0) confN = 0;
         if (confN > 5) confN = 5;
-        var statusBadge = tx.confirmed
-          ? '<span class="pill">confirmed ' + confN + '/5</span>'
-          : '<span class="pill off">unconfirmed</span>';
+        if (!tx.confirmed) confN = 0;
+        var confCls = "conf-pie-wrap";
+        if (tx.confirmed) confCls += " is-confirmed";
+        var confLabel = tx.confirmed ? (confN + "/5") : "mempool";
+        var statusBadge = '<span class="' + confCls + '" title="' + (tx.confirmed ? ("Confirmed " + confN + " of 5") : "Unconfirmed (mempool)") + '">' +
+          '<span class="conf-pie">' + confirmationPieSvg(confN) + '</span>' +
+          '<span class="conf-pie-label">' + confLabel + '</span></span>';
+        var dsBadge = tx.double_spent ? ' <span class="pill warn">Double spent detected</span>' : "";
         tr.innerHTML = '<td data-label="Time">' + escapeHtml(tx.datetime) + '</td>' +
           '<td data-label="Address" class="mono">' + escapeHtml(tx.address) + '</td>' +
           '<td data-label="Txid" class="mono txid-cell"><span class="txid-line">' + txidEsc +
@@ -1269,7 +1332,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
     } catch (e) {
       console.error(e);
       if (e && e.status === 403) {
-        document.body.innerHTML = '<div style="max-width:32rem;margin:3rem auto;padding:1.5rem;background:#151d2c;border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#e8edf5;font-family:Comic Neue,Comic Sans MS,cursive,system-ui,sans-serif"><h1 style="color:#e85d5d;font-size:1.35rem">Access denied</h1><p style="color:#8b9cb8">' + escapeHtml(e.message || "Forbidden") + '</p><p style="color:#8b9cb8">If a token is configured, open <code style="color:#f2a900">http://HOST/{token}/</code>.</p></div>';
+        document.body.innerHTML = '<div style="max-width:24rem;margin:3rem auto;padding:1.5rem;background:#151d2c;border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#e8edf5;font-family:Comic Neue,Comic Sans MS,cursive,system-ui,sans-serif;text-align:center"><h1 style="color:#e85d5d;font-size:1.35rem;margin:0">Access denied</h1></div>';
       }
     }
   }
@@ -1337,7 +1400,8 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       p2p_parallel: parseInt(f.p2p_parallel.value, 10),
       p2p_log: parseInt(f.p2p_log.value, 10),
       api_allowed_ips: parseIPList(f.api_allowed_ips_text.value || ""),
-      api_token: (f.api_token.value || "").trim()
+      user_token: ((f.user_token && f.user_token.value) || "").trim(),
+      admin_token: ((f.admin_token && f.admin_token.value) || "").trim()
     };
     try {
       var r = await fetch(apiPath("/api/start"), { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify(body) });
@@ -1351,11 +1415,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       if (j && j.restart_required) {
         showFlash((j.message || "Restart MemeTracker to apply storage path.") + " Then click Start again if needed.", true);
       } else {
-        var tip = "";
-        if (body.api_token) {
-          tip = " Dashboard URL with token: " + location.origin + "/" + body.api_token + "/";
-        }
-        showFlash("MemeTracker P2P watcher started." + tip, true);
+        showFlash("MemeTracker P2P watcher started.", true);
       }
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
@@ -1419,21 +1479,18 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
   $("#form-allowlist").addEventListener("submit", async function(ev) {
     ev.preventDefault();
     var ips = parseIPList($("#allowlist-text").value || "");
-    var token = ($("#api-token").value || "").trim();
+    var token = ($("#user-token").value || "").trim();
+    var admin = ($("#admin-token").value || "").trim();
     try {
       await api("/api/allowlist", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_allowed_ips: ips, api_token: token })
+        body: JSON.stringify({ api_allowed_ips: ips, user_token: token, admin_token: admin })
       });
       formState.allowDirty = false;
       formState.startDirty = false;
       formState.configFP = "";
-      var tip = "API access settings saved to memetracker_config.json.";
-      if (token) {
-        tip += " Open " + location.origin + "/" + token + "/ for the dashboard when your IP is not allowlisted.";
-      }
-      showFlash(tip, true);
+      showFlash("API access settings saved.", true);
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
   });

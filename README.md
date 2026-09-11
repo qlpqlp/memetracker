@@ -63,12 +63,14 @@ Example `memetracker_config.json` (all fields required for auto-start; `p2p_host
   "p2p_parallel": 3,
   "p2p_log": 1,
   "api_allowed_ips": [],
-  "api_token": ""
+  "user_token": "",
+  "admin_token": ""
 }
 ```
 
-- **`api_allowed_ips`**: optional array of IPv4/IPv6 addresses or CIDR strings (e.g. `"192.168.1.0/24"`). **Omitted or empty** with no token => open access. If non-empty, only listed addresses can open the **web UI** and call `/api/*` / `/track/*` without a token (include `127.0.0.1` for local UI). You can also POST `/api/allowlist`.
-- **`api_token`**: optional URL access token. When set, open `http://HOST/{api_token}/` for the dashboard (UI calls `/{token}/api/...`). Also `/{token}/track/...` and `/{token}/api/...` from any IP (token bypasses the allowlist). Token-only (no IP list) requires the token prefix for UI and API. Do not use reserved names (`api`, `track`, `healthz`, `logo.png`). Env `MTR_API_TOKEN` overrides the file value on process start.
+- **`api_allowed_ips`**: shared IP/CIDR whitelist. Matching clients get **full admin access** (UI + `/api/*` + `/track/*` + `/healthz`) with no token.
+- **`admin_token`**: admin level - web UI and everything via `http://HOST/{admin_token}/`. Env `MTR_ADMIN_TOKEN`.
+- **`user_token`**: user level - only `/{user_token}/track/...` and `/{user_token}/healthz`. Env `MTR_USER_TOKEN` (legacy `MTR_API_TOKEN` / config `api_token` still accepted). Must differ from `admin_token`.
 
 Use `"storage_dir": ""` or omit to keep the default data directory. If you change `storage_dir` to another path while the app is already running with a different data directory, the UI saves the file and asks you to **restart** once.
 
@@ -91,7 +93,8 @@ Use `"storage_dir": ""` or omit to keep the default data directory. If you chang
 | `MTR_CONFIG_PATH` | _(see above)_ | Full path to `memetracker_config.json` |
 | `MTR_NO_BROWSER` | _(empty)_ | Set to `1` to skip opening the browser |
 | `MTR_NO_AUTOSTART` | _(empty)_ | Set to `1` to **not** auto-start P2P even if the config file is complete |
-| `MTR_API_TOKEN` | _(empty)_ | Optional URL access token; overrides `api_token` from config on start |
+| `MTR_USER_TOKEN` / `MTR_API_TOKEN` | _(empty)_ | User token (`/track` + `/healthz`); overrides `user_token` on start |
+| `MTR_ADMIN_TOKEN` | _(empty)_ | Admin token (web UI + `/api`); overrides `admin_token` on start |
 | `MTR_TRUST_XFF` | _(empty)_ | Set to `1` so API IP checks use the first `X-Forwarded-For` address (only if MemeTracker is behind a **trusted** reverse proxy) |
 
 If `MTR_STORAGE_DIR` is unset:
@@ -124,15 +127,16 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 | GET | `/api/mempool?offset=&limit=` | Paginated newest-first mempool txids (`limit` max 100). Prefer this over dumping thousands into `/api/status`. |
 | POST | `/api/start` | Body: full `memetracker_config.json` shape; saves file and starts P2P (or returns `restart_required` if `storage_dir` changed) |
 | POST | `/api/stop` | Stop P2P workers and the Dogebox metrics ticker; HTTP UI keeps running. **Note:** if a complete `memetracker_config.json` exists, the next process restart will auto-start P2P again unless you remove that file or set `MTR_NO_AUTOSTART=1`. |
-| POST | `/api/allowlist` | JSON `{ "api_allowed_ips": ["127.0.0.1"], "api_token": "secret" }`. Empty IP array => allow all IPs when no token prefix is used. Empty `api_token` clears the token. Writes `memetracker_config.json`. |
+| POST | `/api/allowlist` | JSON `{ "api_allowed_ips": [...], "user_token": "...", "admin_token": "..." }`. Writes `memetracker_config.json`. |
 | GET | `/api/config` | `{ list_limit, retention_days }` |
 | POST | `/api/config` | JSON body: `{ "list_limit": 50, "retention_days": 14 }` |
 | DELETE | `/api/addresses/{hash160_hex}` | Untrack address and delete its file |
 | DELETE | `/api/transactions?txid=...&hash160_hex=...` | Remove one stored tx row |
 | GET/POST | `/track/{P2PKH}` | Start or refresh tracking (503 if P2P not running); optional `callback` query / `X-Callback-Url` |
-| GET/POST | `/{api_token}/` | Web UI with token (same as `/`); JS calls `/{token}/api/...` |
-| GET/POST | `/{api_token}/track/{P2PKH}` | Same as `/track/...` when `api_token` is configured; **bypasses IP allowlist** |
-| * | `/{api_token}/api/...` | Same as `/api/...` with token prefix; **bypasses IP allowlist** |
+| GET/POST | `/{admin_token}/` | Admin: web UI + all routes |
+| GET/POST | `/{user_token}/track/{P2PKH}` | User: track address |
+| GET | `/{user_token}/healthz` | User: health check |
+| * | `/{admin_token}/api/...` | Admin: API |
 
 `/api/status` transaction rows include:
 
