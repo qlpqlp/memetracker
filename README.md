@@ -67,8 +67,8 @@ Example `memetracker_config.json` (all fields required for auto-start; `p2p_host
 }
 ```
 
-- **`api_allowed_ips`**: optional array of IPv4/IPv6 addresses or CIDR strings (e.g. `"192.168.1.0/24"`). **Omitted or empty** => any client IP may call `/api/*` and `/track/*` when no URL token is used. If non-empty, only listed addresses can use those paths without a token (include `127.0.0.1` if you use the local web UI against a locked-down API). You can also POST `/api/allowlist` with `{ "api_allowed_ips": ["127.0.0.1"], "api_token": "..." }`.
-- **`api_token`**: optional URL access token. When set, callers may use `http://HOST/{api_token}/track/D...` and `http://HOST/{api_token}/api/...` from any IP (token bypasses the allowlist). Requests **without** the `/{token}/` prefix still follow `api_allowed_ips`. Do not use reserved names (`api`, `track`, `healthz`, `logo.png`). Env `MTR_API_TOKEN` overrides the file value on process start.
+- **`api_allowed_ips`**: optional array of IPv4/IPv6 addresses or CIDR strings (e.g. `"192.168.1.0/24"`). **Omitted or empty** with no token => open access. If non-empty, only listed addresses can open the **web UI** and call `/api/*` / `/track/*` without a token (include `127.0.0.1` for local UI). You can also POST `/api/allowlist`.
+- **`api_token`**: optional URL access token. When set, open `http://HOST/{api_token}/` for the dashboard (UI calls `/{token}/api/...`). Also `/{token}/track/...` and `/{token}/api/...` from any IP (token bypasses the allowlist). Token-only (no IP list) requires the token prefix for UI and API. Do not use reserved names (`api`, `track`, `healthz`, `logo.png`). Env `MTR_API_TOKEN` overrides the file value on process start.
 
 Use `"storage_dir": ""` or omit to keep the default data directory. If you change `storage_dir` to another path while the app is already running with a different data directory, the UI saves the file and asks you to **restart** once.
 
@@ -130,6 +130,7 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 | DELETE | `/api/addresses/{hash160_hex}` | Untrack address and delete its file |
 | DELETE | `/api/transactions?txid=...&hash160_hex=...` | Remove one stored tx row |
 | GET/POST | `/track/{P2PKH}` | Start or refresh tracking (503 if P2P not running); optional `callback` query / `X-Callback-Url` |
+| GET/POST | `/{api_token}/` | Web UI with token (same as `/`); JS calls `/{token}/api/...` |
 | GET/POST | `/{api_token}/track/{P2PKH}` | Same as `/track/...` when `api_token` is configured; **bypasses IP allowlist** |
 | * | `/{api_token}/api/...` | Same as `/api/...` with token prefix; **bypasses IP allowlist** |
 

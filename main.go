@@ -2762,24 +2762,76 @@ func ipAllowedForAPI(host string, rules []string) bool {
 	return false
 }
 
-func apiPathNeedsIPCheck(path string) bool {
-	if strings.HasPrefix(path, "/api/") {
+func requestWantsHTML(r *http.Request) bool {
+	accept := strings.ToLower(r.Header.Get("Accept"))
+	if strings.Contains(accept, "application/json") && !strings.Contains(accept, "text/html") {
+		return false
+	}
+	if strings.Contains(accept, "text/html") {
 		return true
 	}
-	if strings.HasPrefix(path, "/track/") {
+	path := r.URL.Path
+	if path == "/" || path == "" {
 		return true
 	}
-	return false
+	if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/track/") || path == "/healthz" {
+		return false
+	}
+	return true
+}
+
+func serveAccessDenied(w http.ResponseWriter, r *http.Request, clientIP string, hasToken, hasIPRules bool) {
+	msg := fmt.Sprintf("API access denied for IP %s", clientIP)
+	if hasToken && hasIPRules {
+		msg += "; use an allowlisted IP or open /{api_token}/ (and /{api_token}/api/... or /{api_token}/track/...)"
+	} else if hasToken {
+		msg += "; open /{api_token}/ (and /{api_token}/api/... or /{api_token}/track/...)"
+	} else if hasIPRules {
+		msg += "; add this address/CIDR to api_allowed_ips (or clear the list to allow all)"
+	}
+	if requestWantsHTML(r) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Access denied - MemeTracker</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+font-family:"Comic Neue","Comic Sans MS",cursive,system-ui,sans-serif;background:#0c1018;color:#e8edf5;}
+.card{max-width:32rem;padding:1.5rem 1.75rem;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:#151d2c;}
+h1{margin:0 0 .75rem;color:#e85d5d;font-size:1.35rem;}
+p{color:#8b9cb8;line-height:1.5;}
+code{color:#f2a900;word-break:break-all;}
+</style></head><body><div class="card">
+<h1>Access denied</h1>
+<p>This MemeTracker instance is restricted by client IP and/or a URL access token.</p>
+<p>`+htmlEscapeBasic(msg)+`</p>
+<p>If a token is configured, open <code>http://HOST/{token}/</code> in your browser. API calls use <code>/{token}/api/...</code> and <code>/{token}/track/...</code>.</p>
+</div></body></html>`)
+		return
+	}
+	writeJSONError(w, http.StatusForbidden, msg)
+}
+
+func htmlEscapeBasic(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	return s
 }
 
 func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := app.snapshotCfg()
 		token := normalizeAPIToken(cfg.APIToken)
+		rules := normalizeAPIAllowedIPs(cfg.APIAllowedIPs)
+		hasToken := token != ""
+		hasIPRules := len(rules) > 0
 
-		// Optional URL token: /{token}/track/... or /{token}/api/...
-		// When present and valid, skip IP allowlist and rewrite to the real path.
-		if token != "" {
+		// Valid URL token: /{token}/... bypasses IP allowlist and rewrites to the real path.
+		// Also supports /{token} and /{token}/ for the web UI.
+		if hasToken {
 			if newPath, ok := stripAPITokenPrefix(r.URL.Path, token); ok {
 				r2 := r.Clone(r.Context())
 				r2.URL.Path = newPath
@@ -2788,18 +2840,41 @@ func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
 			}
 		}
 
-		if !apiPathNeedsIPCheck(r.URL.Path) {
+		// No restrictions configured: open access (legacy).
+		if !hasToken && !hasIPRules {
 			next.ServeHTTP(w, r)
 			return
 		}
+
+		// Keep health probes reachable when restricted.
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		cl := clientIPForAPI(r)
 		if cl == "" {
 			cl = "unknown"
 		}
-		if !ipAllowedForAPI(cl, cfg.APIAllowedIPs) {
-			writeJSONError(w, http.StatusForbidden, fmt.Sprintf("API access denied for IP %s; use /{api_token}/... if configured, or add this address/CIDR to api_allowed_ips (or clear the list to allow all)", cl))
+
+		ipOK := hasIPRules && ipAllowedForAPI(cl, rules)
+		// Token-only: require token prefix (already handled above).
+		// IP-only: require allowlisted IP.
+		// Both: allowlisted IP OR token prefix.
+		allowed := false
+		if hasToken && hasIPRules {
+			allowed = ipOK
+		} else if hasIPRules {
+			allowed = ipOK
+		} else if hasToken {
+			allowed = false
+		}
+
+		if !allowed {
+			serveAccessDenied(w, r, cl, hasToken, hasIPRules)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }

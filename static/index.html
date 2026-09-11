@@ -400,10 +400,10 @@
           <div style="grid-column:1/-1">
             <label>API allowed IPs (optional)</label>
             <textarea class="code" name="api_allowed_ips_text" rows="3" placeholder="One per line or comma-separated. Empty = allow all. Example:&#10;127.0.0.1&#10;192.168.1.0/24"></textarea>
-            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Restrict <span class="mono">/api/*</span> and <span class="mono">/track/*</span> by client IP when no URL token is used. Include <span class="mono">127.0.0.1</span> if you use this UI locally when listing specific IPs.</p>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Restrict UI, <span class="mono">/api/*</span>, and <span class="mono">/track/*</span> by client IP when no URL token is used. Include <span class="mono">127.0.0.1</span> for local UI without a token.</p>
             <label>API access token (optional)</label>
-            <input name="api_token" type="text" placeholder="empty = disabled; then use /{token}/track/ADDRESS"/>
-            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">When set, callers can use <span class="mono">http://HOST/{token}/track/D...</span> (and <span class="mono">/{token}/api/...</span>) without matching the IP list. Requests without the token still follow the IP allowlist.</p>
+            <input name="api_token" type="text" placeholder="empty = disabled; then use /{token}/ for UI and API"/>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">When set, open <span class="mono">http://HOST/{token}/</span> for the dashboard (and <span class="mono">/{token}/api/...</span>, <span class="mono">/{token}/track/...</span>). Token bypasses the IP list. Behind a reverse proxy, set <span class="mono">MTR_TRUST_XFF=1</span>.</p>
           </div>
           <p style="margin:1rem 0 .5rem"><button type="submit" class="btn btn-primary btn-with-icon" id="btn-start"><span class="material-icons" aria-hidden="true">play_arrow</span><span>Start MemeTracker</span></button></p>
         </form>
@@ -571,8 +571,8 @@
       <section id="panel-security" class="panel">
         <div class="card">
           <h2>API access (IPs + token)</h2>
-          <p class="muted">When the IP list is <strong>empty</strong>, any IP may call <span class="mono">/api/*</span> and <span class="mono">/track/*</span> unless you rely on a token URL. When you add IP entries, only matching addresses/CIDRs can use those paths <em>without</em> a token (this page still loads; include <span class="mono">127.0.0.1</span> for local dashboard refresh). Behind a reverse proxy, set env <span class="mono">MTR_TRUST_XFF=1</span> - see README.</p>
-          <p class="muted">Optional <strong>API token</strong>: with a token configured, automation can call <span class="mono">/{token}/track/YourP2PKH</span> (and <span class="mono">/{token}/api/...</span>) from any IP. Requests that omit the token still use the IP allowlist rules.</p>
+          <p class="muted">When IP allowlist and/or API token are set, the <strong>web UI is restricted</strong> the same way as the API. Use an allowlisted IP, or open <span class="mono">http://HOST/{token}/</span> (the UI then calls <span class="mono">/{token}/api/...</span>). Without a matching IP or token you get Access denied.</p>
+          <p class="muted">Optional <strong>API token</strong>: automation can call <span class="mono">/{token}/track/YourP2PKH</span> and <span class="mono">/{token}/api/...</span> from any IP. Token-only mode (no IP list) requires the token prefix for UI and API.</p>
           <form id="form-allowlist">
             <label>Allowed IPs / CIDRs (one per line)</label>
             <textarea class="code" id="allowlist-text" name="allowlist" rows="5" placeholder="127.0.0.1&#10;10.0.0.0/8"></textarea>
@@ -674,7 +674,27 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
   function sochainTxURL(txid) {
     return "https://sochain.com/tx/DOGE/" + encodeURIComponent(txid);
   }
-  document.getElementById("api-base").textContent = window.location.origin;
+
+  var API_PREFIX = (function() {
+    var segs = location.pathname.split("/").filter(Boolean);
+    var reserved = { api: 1, track: 1, healthz: 1, "logo.png": 1 };
+    if (segs.length && !reserved[String(segs[0]).toLowerCase()]) {
+      return "/" + segs[0];
+    }
+    return "";
+  })();
+
+  function apiPath(path) {
+    if (!path) path = "/";
+    if (path.charAt(0) !== "/") path = "/" + path;
+    return API_PREFIX + path;
+  }
+
+  document.getElementById("api-base").textContent = window.location.origin + API_PREFIX;
+  document.querySelectorAll('img[src="/logo.png"], link[href="/logo.png"]').forEach(function(el) {
+    if (el.tagName === "IMG") el.src = apiPath("/logo.png");
+    else el.href = apiPath("/logo.png");
+  });
 
   const sidebar = $("#sidebar");
   const backdrop = $("#nav-backdrop");
@@ -768,12 +788,79 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
   }
 
   async function api(path, opts) {
-    const r = await fetch(path, Object.assign({ headers: { "Accept": "application/json" } }, opts || {}));
+    const r = await fetch(apiPath(path), Object.assign({ headers: { "Accept": "application/json" } }, opts || {}));
     const t = await r.text();
     let j = null;
     try { j = JSON.parse(t); } catch (_) {}
-    if (!r.ok) throw new Error((j && j.error) || t || r.statusText);
+    if (!r.ok) {
+      var err = new Error((j && j.error) || t || r.statusText);
+      err.status = r.status;
+      throw err;
+    }
     return j;
+  }
+
+  var formState = {
+    startDirty: false,
+    cfgDirty: false,
+    allowDirty: false,
+    configFP: "",
+    settingsFP: "",
+    formsReady: false
+  };
+
+  function configFingerprint(fc) {
+    return JSON.stringify(fc || {});
+  }
+
+  function settingsFingerprint(cfg) {
+    return JSON.stringify({
+      list_limit: cfg && cfg.list_limit,
+      retention_days: cfg && cfg.retention_days
+    });
+  }
+
+  function formHasFocus(form) {
+    var ae = document.activeElement;
+    return !!(form && ae && form.contains(ae));
+  }
+
+  function fillAllowlistFields(fc) {
+    var allow = (fc && fc.api_allowed_ips) || [];
+    var tok = (fc && fc.api_token) || "";
+    var al = $("#allowlist-text");
+    var at = $("#api-token");
+    if (al) al.value = Array.isArray(allow) && allow.length ? allow.join("\n") : "";
+    if (at) at.value = tok;
+  }
+
+  function maybeFillConfigForms(st, settingsCfg) {
+    var fc = st.full_config || {};
+    var cfp = configFingerprint(fc);
+    var sfp = settingsFingerprint(settingsCfg || st.config || {});
+    var startForm = $("#form-start");
+    var cfgForm = $("#form-cfg");
+    var allowForm = $("#form-allowlist");
+
+    var startChanged = cfp !== formState.configFP;
+    var settingsChanged = sfp !== formState.settingsFP;
+
+    if (!formState.formsReady || (startChanged && !formState.startDirty && !formHasFocus(startForm))) {
+      fillStartForm(fc);
+    }
+    if (!formState.formsReady || (startChanged && !formState.allowDirty && !formHasFocus(allowForm))) {
+      fillAllowlistFields(fc);
+    }
+    if (!formState.formsReady || (settingsChanged && !formState.cfgDirty && !formHasFocus(cfgForm))) {
+      if (cfgForm && settingsCfg) {
+        cfgForm.list_limit.value = settingsCfg.list_limit;
+        cfgForm.retention_days.value = settingsCfg.retention_days;
+      }
+    }
+
+    formState.configFP = cfp;
+    formState.settingsFP = sfp;
+    formState.formsReady = true;
   }
 
   var HIST_MAX = 90;
@@ -1047,10 +1134,6 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       $("#wizard-banner").classList.toggle("hidden", run);
       $("#running-banner").classList.toggle("hidden", !run);
       if (st.memetracker_config_path) $("#cfg-path-hint").textContent = st.memetracker_config_path;
-      fillStartForm(st.full_config);
-      var allow = (st.full_config && st.full_config.api_allowed_ips) || [];
-      $("#allowlist-text").value = Array.isArray(allow) && allow.length ? allow.join("\n") : "";
-      $("#api-token").value = (st.full_config && st.full_config.api_token) || "";
 
       $("#dash-updated").textContent = "Updated " + new Date().toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
       var dash = $("#dash-stats");
@@ -1103,9 +1186,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       $("#cfg-readonly").textContent = JSON.stringify(st.config, null, 2);
 
       var cfg = await api("/api/config");
-      var form = $("#form-cfg");
-      form.list_limit.value = cfg.list_limit;
-      form.retention_days.value = cfg.retention_days;
+      maybeFillConfigForms(st, cfg);
 
       var tbody = $("#tbody-addr");
       tbody.innerHTML = "";
@@ -1187,6 +1268,9 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       }
     } catch (e) {
       console.error(e);
+      if (e && e.status === 403) {
+        document.body.innerHTML = '<div style="max-width:32rem;margin:3rem auto;padding:1.5rem;background:#151d2c;border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#e8edf5;font-family:Comic Neue,Comic Sans MS,cursive,system-ui,sans-serif"><h1 style="color:#e85d5d;font-size:1.35rem">Access denied</h1><p style="color:#8b9cb8">' + escapeHtml(e.message || "Forbidden") + '</p><p style="color:#8b9cb8">If a token is configured, open <code style="color:#f2a900">http://HOST/{token}/</code>.</p></div>';
+      }
     }
   }
 
@@ -1256,18 +1340,35 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       api_token: (f.api_token.value || "").trim()
     };
     try {
-      var r = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify(body) });
+      var r = await fetch(apiPath("/api/start"), { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify(body) });
       var t = await r.text();
       var j = null;
       try { j = JSON.parse(t); } catch (_) {}
       if (!r.ok) throw new Error((j && j.error) || t);
+      formState.startDirty = false;
+      formState.allowDirty = false;
+      formState.configFP = "";
       if (j && j.restart_required) {
         showFlash((j.message || "Restart MemeTracker to apply storage path.") + " Then click Start again if needed.", true);
       } else {
-        showFlash("MemeTracker P2P watcher started.", true);
+        var tip = "";
+        if (body.api_token) {
+          tip = " Dashboard URL with token: " + location.origin + "/" + body.api_token + "/";
+        }
+        showFlash("MemeTracker P2P watcher started." + tip, true);
       }
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#form-start").addEventListener("input", function() {
+    formState.startDirty = true;
+  });
+  $("#form-cfg").addEventListener("input", function() {
+    formState.cfgDirty = true;
+  });
+  $("#form-allowlist").addEventListener("input", function() {
+    formState.allowDirty = true;
   });
 
   $("#btn-stop").addEventListener("click", async function() {
@@ -1309,6 +1410,8 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         })
       });
       showFlash("Settings saved.", true);
+      formState.cfgDirty = false;
+      formState.settingsFP = "";
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
   });
@@ -1323,7 +1426,14 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ api_allowed_ips: ips, api_token: token })
       });
-      showFlash("API access settings saved to memetracker_config.json.", true);
+      formState.allowDirty = false;
+      formState.startDirty = false;
+      formState.configFP = "";
+      var tip = "API access settings saved to memetracker_config.json.";
+      if (token) {
+        tip += " Open " + location.origin + "/" + token + "/ for the dashboard when your IP is not allowlisted.";
+      }
+      showFlash(tip, true);
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
   });
