@@ -9,7 +9,7 @@ MemeTracker is a **Dogecoin mempool watcher**: it connects to the public P2P net
 ## How it works
 
 1. **P2P (mempool, priority 1)** - Several parallel sessions (default 3, configurable) connect to DNS seeds or `P2P_HOST`, complete version handshake, send `mempool`, then handle `inv` (transaction inventory), request bodies with `getdata`, and parse `tx` payloads. This path must not be starved.
-2. **P2P (header backup, priority 2)** - Tracks tip headers (`sendheaders` / `getheaders`), persists tip to `{storage}/header_tip.json`, and only scans **recent tip block bodies** when mempool is quiet. Purpose: catch watched payments that missed mempool relay and were mined immediately. Not a full historical block download.
+2. **P2P (header backup, priority 2)** - Tracks tip headers (`sendheaders` / `getheaders`), persists tip + **body-scan cursor** to `{storage}/header_tip.json`, and downloads block bodies **sequentially** from that cursor toward tip (never skips intermediates; resumes after restart). Handles multi-block bursts. Purpose: confirm mempool-seen payments and catch watched payments that missed mempool relay. Not a full historical chain sync; mempool stays first.
 3. **Parsing** - Outputs are scanned for P2PKH / P2SH / v0 P2WPKH patterns; amounts going to a watched **hash160** are summed per transaction.
 4. **Double-spend detection** - Inputs are tracked by outpoint (`prev_txid:vout`) during live mempool observation. If multiple txids spend the same outpoint in the active tracking window, those tx rows are marked as `double_spent = true`. Block-scan hits do not invent mempool conflicts.
 5. **Storage** - Each watched address has a JSON file under `{storage}/addresses/{hash160}.json`. Transactions are capped per address (`list_limit`) and addresses expire after `retention_days` without a refresh via `GET/POST /track/<address>`.
@@ -163,6 +163,12 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 - `blocks_scanned`
 - `confirmed_hits` (watched payments newly stored from block scans)
 - `pending_block_fetches`
+- `pending_block_hashes` (block hashes with getdata in flight)
+- `scanning_block_hash` (block body currently being walked; empty when idle)
+- `scanning_block_height` (number when known, otherwise null)
+- `scanning_started_utc`
+- `last_scanned_block_hash` / `last_scanned_block_height` / `last_scanned_utc` (persisted body-scan cursor; restart resumes from the next block after this)
+- `body_scan_cursor_hash` / `body_scan_cursor_height` (same cursor fields)
 - `retention` (e.g. `24h0m0s`)
 - `persist_path` (usually `{storage}/header_tip.json`)
 - `resumed_from_disk`

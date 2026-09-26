@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,12 +18,14 @@ const (
 	MSG_BLOCK                 = 2
 	AUXPOW_VERSION_BIT        = uint32(1 << 8)
 	HEADER_RETENTION          = 24 * time.Hour
-	// Block bodies are backup-only (missed mempool -> mined). Keep this tiny so mempool wins.
-	BLOCK_BODY_SCAN_MAX_AGE   = 30 * time.Minute
-	BLOCK_BODY_SCAN_MAX_DEPTH = 3
+	// Block bodies are backup-only (missed mempool -> mined) and confirmation catch-up.
+	// Depth must cover delayed tip scans so mempool-seen payments do not stay at 0 confs.
+	BLOCK_BODY_SCAN_MAX_AGE   = 45 * time.Minute
+	BLOCK_BODY_SCAN_MAX_DEPTH = 24
 	MAX_HEADER_RING           = 2000
-	MAX_BLOCK_FETCH_INV       = 1
-	MAX_PENDING_BLOCKS        = 2
+	MAX_BLOCK_FETCH_INV       = 8 // allow Dogecoin multi-block bursts without skipping
+	MAX_PENDING_BLOCKS        = 12
+	CONFIRMATION_CATCHUP_DEPTH = 64 // sequential resume window toward tip
 	GETHEADERS_TOPUP_SEC      = 120 // slower while watching payments
 	GETHEADERS_TOPUP_IDLE_SEC = 45  // faster tip tracking when no watchers
 	PROTOCOL_VERSION_HEADERS  = int32(70015)
@@ -43,35 +46,49 @@ type headerTipDisk struct {
 	TipHeight      int64  `json:"tip_height"`
 	TipHeader80Hex string `json:"tip_header80_hex"`
 	UpdatedUTC     string `json:"updated_utc"`
+	// Body scan cursor: last fully scanned block body. Restart resumes from the next
+	// child toward tip (never jumps to tip and skips intermediates).
+	BodyScanHash   string `json:"body_scan_hash,omitempty"`
+	BodyScanHeight int64  `json:"body_scan_height,omitempty"`
+	BodyScanUTC    string `json:"body_scan_utc,omitempty"`
 }
 
 // HeaderTracker keeps a rolling ~24h window of headers for tip resume/locators.
 // Full block downloads are a backup path only: catch watched payments that skipped
 // mempool relay and landed in a block. Mempool watching must stay first priority.
 type HeaderTracker struct {
-	mu            sync.RWMutex
-	byHash        map[string]*storedHeader
-	order         []string // oldest -> newest hash hex
-	scanned       map[string]struct{}
-	pending       map[string]struct{}
-	tipHash       string
-	tipTime       time.Time
-	tipHeight     int64 // -1 unknown
-	tipHeader80   []byte
-	persistPath   string
-	headersSeen   int64
-	blocksScanned int64
-	confirmedHits int64
-	walkBackDone  bool
+	mu             sync.RWMutex
+	byHash         map[string]*storedHeader
+	order          []string // oldest -> newest hash hex
+	scanned        map[string]struct{}
+	pending        map[string]struct{}
+	tipHash        string
+	tipTime        time.Time
+	tipHeight      int64 // -1 unknown
+	tipHeader80    []byte
+	persistPath    string
+	headersSeen    int64
+	blocksScanned  int64
+	confirmedHits  int64
+	walkBackDone   bool
 	loadedFromDisk bool
+	// Live body-scan progress for the dashboard /api/status.
+	scanningHash    string
+	scanningHeight  int64 // -1 unknown
+	scanningStarted time.Time
+	lastScannedHash    string
+	lastScannedHeight  int64 // -1 unknown
+	lastScannedAt      time.Time
 }
 
 func NewHeaderTracker(persistDir string) *HeaderTracker {
 	h := &HeaderTracker{
-		byHash:    make(map[string]*storedHeader),
-		scanned:   make(map[string]struct{}),
-		pending:   make(map[string]struct{}),
-		tipHeight: -1,
+		byHash:             make(map[string]*storedHeader),
+		scanned:            make(map[string]struct{}),
+		pending:            make(map[string]struct{}),
+		tipHeight:          -1,
+		scanningHeight:     -1,
+		lastScannedHeight:  -1,
 	}
 	if persistDir != "" {
 		h.persistPath = filepath.Join(persistDir, headerTipFileName)
@@ -158,7 +175,6 @@ func (h *HeaderTracker) loadTipLocked() {
 		}
 		h.order = append(h.order, disk.TipHash)
 		h.tipHeader80 = cp
-		h.scanned[disk.TipHash] = struct{}{}
 		h.headersSeen = 1
 	} else {
 		// Locator-only resume seed (hash known, header bytes missing).
@@ -173,6 +189,21 @@ func (h *HeaderTracker) loadTipLocked() {
 	h.tipHash = disk.TipHash
 	h.tipTime = ts
 	h.tipHeight = height
+	// Restore sequential body-scan cursor (do NOT mark tip as body-scanned).
+	bodyHash := strings.TrimSpace(strings.ToLower(disk.BodyScanHash))
+	if bodyHash != "" && len(bodyHash) == 64 {
+		h.lastScannedHash = bodyHash
+		h.lastScannedHeight = disk.BodyScanHeight
+		if h.lastScannedHeight < -1 {
+			h.lastScannedHeight = -1
+		}
+		if disk.BodyScanUTC != "" {
+			if t, err := time.Parse(time.RFC3339, disk.BodyScanUTC); err == nil {
+				h.lastScannedAt = t.UTC()
+			}
+		}
+		h.scanned[bodyHash] = struct{}{}
+	}
 	h.loadedFromDisk = true
 }
 
@@ -192,6 +223,13 @@ func (h *HeaderTracker) saveTipLocked() {
 		disk.TipHeader80Hex = hex.EncodeToString(h.tipHeader80)
 	} else if sh, ok := h.byHash[h.tipHash]; ok && len(sh.Header80) == 80 {
 		disk.TipHeader80Hex = hex.EncodeToString(sh.Header80)
+	}
+	if h.lastScannedHash != "" {
+		disk.BodyScanHash = h.lastScannedHash
+		disk.BodyScanHeight = h.lastScannedHeight
+		if !h.lastScannedAt.IsZero() {
+			disk.BodyScanUTC = h.lastScannedAt.UTC().Format(time.RFC3339)
+		}
 	}
 	b, err := json.MarshalIndent(disk, "", "  ")
 	if err != nil {
@@ -218,18 +256,53 @@ func (h *HeaderTracker) Snapshot() map[string]any {
 	} else {
 		tipHeight = nil
 	}
+	pendingHashes := make([]string, 0, len(h.pending))
+	for hx := range h.pending {
+		pendingHashes = append(pendingHashes, hx)
+	}
+	sort.Strings(pendingHashes)
+
+	var scanHeight any
+	if h.scanningHeight >= 0 {
+		scanHeight = h.scanningHeight
+	} else {
+		scanHeight = nil
+	}
+	scanStarted := ""
+	if !h.scanningStarted.IsZero() {
+		scanStarted = h.scanningStarted.UTC().Format(time.RFC3339)
+	}
+	var lastH any
+	if h.lastScannedHeight >= 0 {
+		lastH = h.lastScannedHeight
+	} else {
+		lastH = nil
+	}
+	lastAt := ""
+	if !h.lastScannedAt.IsZero() {
+		lastAt = h.lastScannedAt.UTC().Format(time.RFC3339)
+	}
 	return map[string]any{
-		"tip_hash":              h.tipHash,
-		"tip_height":            tipHeight,
-		"tip_time_utc":          tipTime,
-		"headers_kept":          len(h.byHash),
-		"headers_seen_total":    h.headersSeen,
-		"blocks_scanned":        h.blocksScanned,
-		"confirmed_hits":        h.confirmedHits,
-		"pending_block_fetches": len(h.pending),
-		"retention":             HEADER_RETENTION.String(),
-		"persist_path":          h.persistPath,
-		"resumed_from_disk":     h.loadedFromDisk,
+		"tip_hash":               h.tipHash,
+		"tip_height":             tipHeight,
+		"tip_time_utc":           tipTime,
+		"headers_kept":           len(h.byHash),
+		"headers_seen_total":     h.headersSeen,
+		"blocks_scanned":         h.blocksScanned,
+		"confirmed_hits":         h.confirmedHits,
+		"pending_block_fetches":  len(h.pending),
+		"pending_block_hashes":   pendingHashes,
+		"scanning_block_hash":    h.scanningHash,
+		"scanning_block_height":  scanHeight,
+		"scanning_started_utc":   scanStarted,
+		"last_scanned_block_hash":   h.lastScannedHash,
+		"last_scanned_block_height": lastH,
+		"last_scanned_utc":          lastAt,
+		"body_scan_cursor_hash":     h.lastScannedHash,
+		"body_scan_cursor_height":   lastH,
+		"retention":                 HEADER_RETENTION.String(),
+		"persist_path":              h.persistPath,
+		"resumed_from_disk":         h.loadedFromDisk,
 	}
 }
 
@@ -277,11 +350,63 @@ func (h *HeaderTracker) MarkScanned(hashHex string) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	height := int64(-1)
+	if sh, ok := h.byHash[hashHex]; ok {
+		height = sh.Height
+	}
+	if h.scanningHash == hashHex && h.scanningHeight >= 0 {
+		height = h.scanningHeight
+	}
 	if _, ok := h.scanned[hashHex]; !ok {
 		h.scanned[hashHex] = struct{}{}
 		h.blocksScanned++
 	}
 	delete(h.pending, hashHex)
+	// Advance sequential cursor only forward (by height when known).
+	advance := true
+	if h.lastScannedHeight >= 0 && height >= 0 && height < h.lastScannedHeight {
+		advance = false
+	}
+	if advance {
+		h.lastScannedHash = hashHex
+		h.lastScannedHeight = height
+		h.lastScannedAt = time.Now().UTC()
+		h.saveTipLocked()
+	}
+	if h.scanningHash == hashHex {
+		h.scanningHash = ""
+		h.scanningHeight = -1
+		h.scanningStarted = time.Time{}
+	}
+}
+
+// SetScanning marks which block body is actively being walked for confirmations.
+func (h *HeaderTracker) SetScanning(hashHex string, height int64) {
+	if hashHex == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if height < 0 {
+		if sh, ok := h.byHash[hashHex]; ok {
+			height = sh.Height
+		}
+	}
+	h.scanningHash = hashHex
+	h.scanningHeight = height
+	h.scanningStarted = time.Now().UTC()
+}
+
+// ClearScanning clears the live scan marker when a body walk finishes or fails.
+func (h *HeaderTracker) ClearScanning(hashHex string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if hashHex != "" && h.scanningHash != "" && h.scanningHash != hashHex {
+		return
+	}
+	h.scanningHash = ""
+	h.scanningHeight = -1
+	h.scanningStarted = time.Time{}
 }
 
 func (h *HeaderTracker) AddConfirmedHits(n int) {
@@ -360,11 +485,11 @@ func (h *HeaderTracker) WantBlockBody(hashHex string) bool {
 }
 
 func (h *HeaderTracker) markHeaderOnlyLocked(hashHex string) {
-	if hashHex == "" || hashHex == h.tipHash {
+	// Do NOT put hash in scanned here. "scanned" means the block body was actually
+	// walked for watched payments / confirmation. Marking deep/old headers as scanned
+	// without a body download left mempool-seen txs stuck at 0 confirmations forever.
+	if hashHex == "" {
 		return
-	}
-	if _, ok := h.scanned[hashHex]; !ok {
-		h.scanned[hashHex] = struct{}{}
 	}
 	delete(h.pending, hashHex)
 }
@@ -522,6 +647,96 @@ func (h *HeaderTracker) ParentToBackfill() string {
 		return prev
 	}
 	return ""
+}
+
+// NextSequentialBodyHashes returns the next block bodies to download in chain
+// order (oldest first after the persisted cursor, toward tip). Never returns the
+// tip alone when intermediate blocks are still unscanned. Handles multi-block
+// bursts by returning up to `limit` sequential hashes.
+func (h *HeaderTracker) NextSequentialBodyHashes(limit int) []string {
+	if limit <= 0 {
+		limit = MAX_BLOCK_FETCH_INV
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.tipHash == "" {
+		return nil
+	}
+	cursor := h.lastScannedHash
+	if cursor == "" {
+		// First run: establish cursor by scanning current tip only.
+		if _, scanned := h.scanned[h.tipHash]; scanned {
+			return nil
+		}
+		if _, pending := h.pending[h.tipHash]; pending {
+			return nil
+		}
+		return []string{h.tipHash}
+	}
+	if cursor == h.tipHash {
+		return nil
+	}
+
+	// Walk tip -> ... until cursor (or window limit). Collect blocks AFTER cursor.
+	behind := make([]string, 0, limit)
+	cur := h.tipHash
+	foundCursor := false
+	for steps := 0; steps < CONFIRMATION_CATCHUP_DEPTH && cur != ""; steps++ {
+		if cur == cursor {
+			foundCursor = true
+			break
+		}
+		behind = append(behind, cur) // tip-first
+		sh, ok := h.byHash[cur]
+		if !ok {
+			break
+		}
+		prev := sh.PrevHex
+		if prev == "" || prev == "0000000000000000000000000000000000000000000000000000000000000000" {
+			break
+		}
+		cur = prev
+	}
+	if !foundCursor {
+		// Cursor not in recent header ring (long downtime / reorg). Resume from the
+		// oldest hash we still have so we do not jump to tip and skip the window.
+		if len(behind) == 0 {
+			return nil
+		}
+	}
+	// Reverse to oldest-first: cursor+1 ... tip
+	for i, j := 0, len(behind)-1; i < j; i, j = i+1, j-1 {
+		behind[i], behind[j] = behind[j], behind[i]
+	}
+	out := make([]string, 0, limit)
+	for _, hx := range behind {
+		if _, pending := h.pending[hx]; pending {
+			continue
+		}
+		if _, scanned := h.scanned[hx]; scanned {
+			continue
+		}
+		out = append(out, hx)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// AdvanceBodyCursorToTip moves the sequential cursor to tip without downloading
+// bodies (used when nothing is being watched so we do not backlog forever).
+func (h *HeaderTracker) AdvanceBodyCursorToTip() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.tipHash == "" || h.lastScannedHash == h.tipHash {
+		return
+	}
+	h.lastScannedHash = h.tipHash
+	h.lastScannedHeight = h.tipHeight
+	h.lastScannedAt = time.Now().UTC()
+	h.scanned[h.tipHash] = struct{}{}
+	h.saveTipLocked()
 }
 
 func (h *HeaderTracker) LocatorHashes(max int) [][32]byte {

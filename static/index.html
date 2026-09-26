@@ -460,7 +460,7 @@
         </div>
         <div class="card" id="tip-card">
           <h2>Header tip</h2>
-          <p class="muted" style="margin:.25rem 0 .75rem">Backup tip for resume after restart. Mempool watching stays first; tip-block scans only run when mempool is quiet.</p>
+          <p class="muted" style="margin:.25rem 0 .75rem">Backup tip for resume after restart. Block bodies are scanned <strong>in chain order</strong> from a persisted cursor (never tip-jump skipping blocks). Multi-block bursts are queued sequentially.</p>
           <div class="tip-row">
             <div>
               <div class="statLBL">Block height</div>
@@ -474,6 +474,15 @@
               </div>
               <div class="stat-rownote" id="tip-meta"></div>
             </div>
+          </div>
+          <div style="margin-top:1rem;padding-top:.85rem;border-top:1px solid var(--border)">
+            <div class="statLBL">Scanning block body</div>
+            <div class="statVAL" id="scan-height" style="font-size:1.1rem;margin-top:.25rem">idle</div>
+            <div class="txid-line mono" style="margin-top:.35rem;word-break:break-all">
+              <span id="scan-hash">n/a</span>
+              <button type="button" class="copy-tx-badge hidden" id="scan-copy" data-copy-tx="" title="Copy scanning block hash" aria-label="Copy scanning block hash"><span class="material-icons" aria-hidden="true">content_copy</span></button>
+            </div>
+            <div class="stat-rownote" id="scan-meta">No block body scan in progress.</div>
           </div>
         </div>
         <div class="card">
@@ -674,7 +683,7 @@ curl -s -X POST BASE/{admin_token}/api/broadcast -H "Content-Type: application/j
           <h3>Double-spend flag in API data</h3>
           <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span>, <span class="mono">confirmed</span>, and <span class="mono">confirmations</span> (0-5, from headers/blocks after inclusion).</p>
           <h3>Header safeguard in API data</h3>
-          <p>Object <span class="mono">header_safeguard</span> includes tip hash, tip height (when known), tip time, headers kept, blocks scanned, <span class="mono">confirmed_hits</span>, and whether the tip was resumed from disk.</p>
+          <p>Object <span class="mono">header_safeguard</span> includes tip hash, tip height (when known), tip time, headers kept, blocks scanned, the block currently being scanned (<span class="mono">scanning_block_hash</span> / height), pending block getdata hashes, <span class="mono">confirmed_hits</span>, and whether the tip was resumed from disk.</p>
           <h3>Remove address / tx row</h3>
           <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
 curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
@@ -1227,9 +1236,80 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       if (hs.resumed_from_disk) tipMetaParts.push("Resumed from disk");
       if (hs.persist_path) tipMetaParts.push(hs.persist_path);
       $("#tip-meta").textContent = tipMetaParts.join(" · ");
+
+      var scanHash = hs.scanning_block_hash ? String(hs.scanning_block_hash) : "";
+      var lastHash = hs.last_scanned_block_hash ? String(hs.last_scanned_block_hash) : "";
+      var scanHeightEl = $("#scan-height");
+      var scanHashEl = $("#scan-hash");
+      var scanCopy = $("#scan-copy");
+      var scanMeta = $("#scan-meta");
+      if (scanHash) {
+        scanHeightEl.textContent = (hs.scanning_block_height != null && hs.scanning_block_height !== "")
+          ? ("scanning height " + hs.scanning_block_height)
+          : "scanning…";
+        scanHashEl.textContent = scanHash;
+        scanCopy.classList.remove("hidden");
+        scanCopy.setAttribute("data-copy-tx", scanHash);
+        var scanParts = ["Walking txs for confirmations / missed payments"];
+        if (hs.scanning_started_utc) scanParts.push("started " + hs.scanning_started_utc);
+        scanMeta.textContent = scanParts.join(" · ");
+      } else {
+        var pendingN = hs.pending_block_fetches != null ? Number(hs.pending_block_fetches) : 0;
+        var pendingHashes = Array.isArray(hs.pending_block_hashes) ? hs.pending_block_hashes : [];
+        if (pendingN > 0) {
+          scanHeightEl.textContent = "waiting for body";
+          var ph = pendingHashes.length ? String(pendingHashes[0]) : "";
+          scanHashEl.textContent = ph || (pendingN + " pending getdata");
+          if (ph) {
+            scanCopy.classList.remove("hidden");
+            scanCopy.setAttribute("data-copy-tx", ph);
+          } else {
+            scanCopy.classList.add("hidden");
+            scanCopy.setAttribute("data-copy-tx", "");
+          }
+          scanMeta.textContent = pendingN + " block getdata pending" +
+            (pendingHashes.length > 1 ? (" (showing 1 of " + pendingHashes.length + ")") : "");
+        } else if (lastHash) {
+          scanHeightEl.textContent = (hs.last_scanned_block_height != null && hs.last_scanned_block_height !== "")
+            ? ("last scanned height " + hs.last_scanned_block_height)
+            : "last scanned";
+          scanHashEl.textContent = lastHash;
+          scanCopy.classList.remove("hidden");
+          scanCopy.setAttribute("data-copy-tx", lastHash);
+          var lastParts = ["Idle between scans"];
+          if (hs.last_scanned_utc) lastParts.push("finished " + hs.last_scanned_utc);
+          if (hs.blocks_scanned != null) lastParts.push("total bodies " + hs.blocks_scanned);
+          scanMeta.textContent = lastParts.join(" · ");
+        } else {
+          scanHeightEl.textContent = "idle";
+          scanHashEl.textContent = "n/a";
+          scanCopy.classList.add("hidden");
+          scanCopy.setAttribute("data-copy-tx", "");
+          var idleNote = "No block body scan in progress.";
+          if (hs.blocks_scanned) idleNote += " Total bodies scanned: " + hs.blocks_scanned + ".";
+          scanMeta.textContent = idleNote;
+        }
+      }
+
       var tipLabel = tipHash ? tipHash.slice(0, 12) + "..." : "n/a";
       var tipHint = hs.tip_time_utc ? ("Tip time " + hs.tip_time_utc) : "Waiting for headers/blocks while P2P runs.";
       var heightLabel = (hs.tip_height != null && hs.tip_height !== "") ? String(hs.tip_height) : "n/a";
+      var scanStat = "idle";
+      var scanHint = "Scans are often faster than the 4s poll, so this shows last/active body.";
+      if (scanHash) {
+        scanStat = (hs.scanning_block_height != null && hs.scanning_block_height !== "")
+          ? String(hs.scanning_block_height)
+          : (scanHash.slice(0, 10) + "...");
+        scanHint = "Currently scanning block " + scanHash.slice(0, 16) + "...";
+      } else if (hs.pending_block_fetches) {
+        scanStat = "pending " + hs.pending_block_fetches;
+        scanHint = "Block getdata in flight for confirmation catch-up.";
+      } else if (lastHash) {
+        scanStat = (hs.last_scanned_block_height != null && hs.last_scanned_block_height !== "")
+          ? ("last " + hs.last_scanned_block_height)
+          : (lastHash.slice(0, 10) + "...");
+        scanHint = "Last body scan " + lastHash.slice(0, 16) + "...";
+      }
       var statRows = [
         { k: "P2P running", v: run ? "yes" : "no", hint: run ? "Workers rotate peers between sessions." : "Start from the banner or use a complete memetracker_config.json." },
         { k: "Tracked addresses", v: st.watched_addresses },
@@ -1239,6 +1319,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         { k: "Header tip height", v: heightLabel, hint: tipHint },
         { k: "Header tip hash", v: tipLabel, hint: tipHash ? "Full hash in Header tip card (copy button)." : tipHint },
         { k: "Headers kept (~24h)", v: hs.headers_kept != null ? hs.headers_kept : 0 },
+        { k: "Scanning block", v: scanStat, hint: scanHint },
         { k: "Blocks scanned", v: hs.blocks_scanned != null ? hs.blocks_scanned : 0, hint: "Bodies scanned for watched payments." },
         { k: "Confirmed via blocks", v: hs.confirmed_hits != null ? hs.confirmed_hits : 0, hint: "New rows stored from block scans (mempool miss safeguard)." }
       ];

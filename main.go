@@ -1232,6 +1232,20 @@ func (s *Store) KnowsTxid(txid string) bool {
 	return false
 }
 
+// HasUnconfirmedTxs is true when any stored payment was never seen in a scanned block body.
+func (s *Store) HasUnconfirmedTxs() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, ad := range s.watchByHash {
+		for _, tx := range ad.Txs {
+			if !tx.Confirmed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // RefreshConfirmations updates confirmation counts for already-confirmed txs as tip advances.
 func (s *Store) RefreshConfirmations(tipHeight int64) {
 	if tipHeight < 0 {
@@ -2250,9 +2264,13 @@ func sendGetHeaders(conn net.Conn, htrack *HeaderTracker, logf, logv func(string
 }
 
 func queueBlockFetches(conn net.Conn, htrack *HeaderTracker, hashHexes []string, logf, logv func(string, ...any)) error {
+	return queueBlockFetchesOpt(conn, htrack, hashHexes, true, logf, logv)
+}
+
+func queueBlockFetchesOpt(conn net.Conn, htrack *HeaderTracker, hashHexes []string, requireWant bool, logf, logv func(string, ...any)) error {
 	pending := make([]string, 0, MAX_BLOCK_FETCH_INV)
 	for _, hx := range hashHexes {
-		if !htrack.WantBlockBody(hx) {
+		if requireWant && !htrack.WantBlockBody(hx) {
 			continue
 		}
 		if !htrack.NeedBlock(hx) {
@@ -2282,8 +2300,27 @@ func queueBlockFetches(conn net.Conn, htrack *HeaderTracker, hashHexes []string,
 		}
 		return err
 	}
-	logf("getdata blocks n=%d", len(pending))
+	logf("getdata blocks n=%d sequential=%v", len(pending), !requireWant)
 	return nil
+}
+
+// queueSequentialBlockBodies downloads the next unscanned bodies after the persisted
+// cursor toward tip (oldest first). Never jumps to tip when intermediates remain.
+func queueSequentialBlockBodies(conn net.Conn, store *Store, htrack *HeaderTracker, logf, logv func(string, ...any)) error {
+	if store == nil || htrack == nil {
+		return nil
+	}
+	needBodies := store.watcherCount() > 0 || store.HasUnconfirmedTxs()
+	if !needBodies {
+		htrack.AdvanceBodyCursorToTip()
+		return nil
+	}
+	hashes := htrack.NextSequentialBodyHashes(MAX_BLOCK_FETCH_INV)
+	if len(hashes) == 0 {
+		return nil
+	}
+	logv("sequential body scan queue n=%d first=%s last=%s", len(hashes), hashes[0], hashes[len(hashes)-1])
+	return queueBlockFetchesOpt(conn, htrack, hashes, false, logf, logv)
 }
 
 func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, payload []byte, logf, logv func(string, ...any)) []string {
@@ -2305,6 +2342,8 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 	if blockH < 0 && tipH >= 0 && hashHex == htrack.TipHash() {
 		blockH = tipH
 	}
+	htrack.SetScanning(hashHex, blockH)
+	defer htrack.ClearScanning(hashHex)
 	hits := 0
 	confirmedNew := 0
 	err := forEachBlockTxRaw(payload, func(idx int, txRaw []byte) error {
@@ -2384,16 +2423,12 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 		if !gotVerack || !headersEnabled {
 			return nil
 		}
+		// Sequential body scan from persisted cursor (handles multi-block bursts).
+		if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+			return err
+		}
 		if mempoolBusy() {
 			return nil
-		}
-		// Backup only: optional tiny parent backfill when idle and no recent mempool activity.
-		if allowBackfill && store.watcherCount() == 0 {
-			if parent := htrack.ParentToBackfill(); parent != "" {
-				if err := queueBlockFetches(conn, htrack, []string{parent}, logf, logv); err != nil {
-					return err
-				}
-			}
 		}
 		topup := time.Duration(GETHEADERS_TOPUP_SEC) * time.Second
 		if store.watcherCount() == 0 {
@@ -2561,21 +2596,14 @@ readLoop:
 				continue
 			}
 			logf("recv HEADERS peer=%s count=%d", stateLastPeer, len(hdrs))
-			var tipHex string
 			for _, h80 := range hdrs {
-				hx, _ := htrack.RememberHeader80(h80)
-				if hx != "" {
-					tipHex = hx // last in batch is newest from peer
-				}
+				_, _ = htrack.RememberHeader80(h80)
 			}
 			store.RefreshConfirmations(htrack.TipHeight())
-			// Backup tip body: always allow one tip fetch on new headers (missed+mined case).
-			// Parent backfill / inv block fetches still yield to mempool.
-			if tipHex != "" {
-				if err := queueBlockFetches(conn, htrack, []string{tipHex}, logf, logv); err != nil {
-					sessionExit = err
-					break readLoop
-				}
+			// Sequential bodies after cursor (never tip-only when intermediates remain).
+			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+				sessionExit = err
+				break readLoop
 			}
 			if len(hdrs) > 0 {
 				lastGetHeaders = time.Now()
@@ -2591,6 +2619,11 @@ readLoop:
 		case "block":
 			logv("recv BLOCK payload_len=%d (backup scan)", len(payload))
 			_ = handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
+			// Keep walking sequentially after each body (multi-block bursts).
+			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+				sessionExit = err
+				break readLoop
+			}
 
 		case "inv":
 			if !gotVerack || !mempoolSent {
@@ -2681,21 +2714,10 @@ readLoop:
 				}
 			}
 
-			// Priority 2 (backup): always try one tip/new block body (mempool getdata already sent first).
-			if len(blockHashes) > 0 {
-				pick := blockHashes[len(blockHashes)-1]
-				if tip := htrack.TipHash(); tip != "" {
-					for _, bh := range blockHashes {
-						if bh == tip {
-							pick = tip
-							break
-						}
-					}
-				}
-				if err := queueBlockFetches(conn, htrack, []string{pick}, logf, logv); err != nil {
-					sessionExit = err
-					break readLoop
-				}
+			// Priority 2: sequential bodies from cursor (handles multi-block inv bursts).
+			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+				sessionExit = err
+				break readLoop
 			}
 
 		default:
