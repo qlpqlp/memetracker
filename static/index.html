@@ -428,9 +428,9 @@
             <label>Admin token (web UI + everything)</label>
             <input name="admin_token" type="text" placeholder="admin token"/>
             <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Level 2: dashboard and <span class="mono">/api/*</span> via <span class="mono">/{admin_token}/</span>. Env <span class="mono">MTR_ADMIN_TOKEN</span>.</p>
-            <label>User token (/track + /healthz only)</label>
+            <label>User token (/track + /healthz + /broadcast)</label>
             <input name="user_token" type="text" placeholder="user token"/>
-            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Level 1: <span class="mono">/{user_token}/track/D...</span> and <span class="mono">/{user_token}/healthz</span>. Env <span class="mono">MTR_USER_TOKEN</span> (or legacy <span class="mono">MTR_API_TOKEN</span>).</p>
+            <p class="muted" style="margin:0 0 .5rem;font-size:.78rem">Level 1: <span class="mono">/{user_token}/track/D...</span>, <span class="mono">/{user_token}/healthz</span>, and <span class="mono">/{user_token}/broadcast</span>. Env <span class="mono">MTR_USER_TOKEN</span> (or legacy <span class="mono">MTR_API_TOKEN</span>).</p>
           </div>
           <p style="margin:1rem 0 .5rem"><button type="submit" class="btn btn-primary btn-with-icon" id="btn-start"><span class="material-icons" aria-hidden="true">play_arrow</span><span>Start MemeTracker</span></button></p>
         </form>
@@ -592,6 +592,14 @@
               <tbody id="tbody-recent-tx"></tbody>
             </table>
           </div>
+          <h3 style="margin:1.5rem 0 .5rem;font-size:1rem">Broadcast signed transaction</h3>
+          <p class="muted" style="margin:0 0 .75rem">Paste a fully signed raw Dogecoin transaction (hex). MemeTracker sends a P2P <span class="mono">tx</span> message to every currently connected peer and reports which peers accepted the write.</p>
+          <form id="form-broadcast">
+            <label for="broadcast-hex">Signed raw tx (hex)</label>
+            <textarea class="code" id="broadcast-hex" name="raw_tx" rows="6" placeholder="0100000001..." required></textarea>
+            <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">send</span><span>Transmit to peers</span></button>
+          </form>
+          <div id="broadcast-result" class="hidden" style="margin-top:1rem"></div>
         </div>
       </section>
 
@@ -600,7 +608,7 @@
           <h2>Access control</h2>
           <p class="muted" style="margin:0 0 1rem">Two levels, optional shared IP whitelist:</p>
           <ul class="muted" style="margin:0 0 1rem;padding-left:1.2rem;font-size:.88rem;line-height:1.55">
-            <li><strong>User</strong> - <span class="mono">/track/&#123;address&#125;</span> and <span class="mono">/healthz</span> only (user token)</li>
+            <li><strong>User</strong> - <span class="mono">/track/&#123;address&#125;</span>, <span class="mono">/healthz</span>, and <span class="mono">/broadcast</span> (user token)</li>
             <li><strong>Admin</strong> - web UI + <span class="mono">/api/*</span> + everything (admin token)</li>
             <li><strong>IP whitelist</strong> - same list for both; matching IPs get full admin access without a token</li>
           </ul>
@@ -611,8 +619,8 @@
             <input id="admin-token" name="admin_token" type="text" placeholder="admin token for web UI and /api"/>
             <p class="muted" style="margin:0 0 .75rem;font-size:.78rem"><span class="mono">http://HOST/{admin_token}/</span> · env <span class="mono">MTR_ADMIN_TOKEN</span></p>
             <label>User token</label>
-            <input id="user-token" name="user_token" type="text" placeholder="user token for /track and /healthz"/>
-            <p class="muted" style="margin:0 0 .75rem;font-size:.78rem"><span class="mono">/{user_token}/track/D...</span> · <span class="mono">/{user_token}/healthz</span> · env <span class="mono">MTR_USER_TOKEN</span></p>
+            <input id="user-token" name="user_token" type="text" placeholder="user token for /track, /healthz, /broadcast"/>
+            <p class="muted" style="margin:0 0 .75rem;font-size:.78rem"><span class="mono">/{user_token}/track/D...</span> · <span class="mono">/{user_token}/healthz</span> · <span class="mono">/{user_token}/broadcast</span> · env <span class="mono">MTR_USER_TOKEN</span></p>
             <button type="submit" class="btn btn-primary btn-with-icon"><span class="material-icons" aria-hidden="true">vpn_key</span><span>Save access settings</span></button>
           </form>
         </div>
@@ -637,7 +645,7 @@
           <h3>Double-spend detection (mempool)</h3>
           <p>MemeTracker also checks transaction <strong>inputs</strong> while watching live mempool traffic. If two or more mempool transactions spend the same previous output (same <span class="mono">prev_txid:vout</span>), they are flagged as a conflict and shown with a red <strong>Double spent detected</strong> badge. This check is live-window only: once transactions disappear from the current mempool tracking window, they are no longer actively compared. The feature is intended for transactions related to watched payment addresses.</p>
           <h3>Access control</h3>
-          <p><strong>User token</strong>: <span class="mono">/track/&#123;address&#125;</span> and <span class="mono">/healthz</span>. <strong>Admin token</strong>: web UI and <span class="mono">/api/*</span>. Shared IP whitelist grants full access. Unauthorized = Access denied only.</p>
+          <p><strong>User token</strong>: <span class="mono">/track/&#123;address&#125;</span>, <span class="mono">/healthz</span>, and <span class="mono">/broadcast</span>. <strong>Admin token</strong>: web UI and <span class="mono">/api/*</span>. Shared IP whitelist grants full access. Unauthorized = Access denied only.</p>
         </div>
         <div class="card help-block">
           <h2>HTTP API reference</h2>
@@ -657,7 +665,12 @@ curl -s -X POST BASE/api/stop</code></pre>
           <h3>Track address (user)</h3>
           <pre><code>curl -s "BASE/track/YourP2PKHAddress"
 curl -s "BASE/{user_token}/track/YourP2PKHAddress"</code></pre>
-          <p class="muted">User token: <span class="mono">/track</span> + <span class="mono">/healthz</span>. Admin token: web UI + <span class="mono">/api</span>. Shared IP whitelist = full access.</p>
+          <h3>Broadcast signed tx</h3>
+          <pre><code>curl -s -X POST BASE/broadcast -H "Content-Type: application/json" -d "{\"raw_tx\":\"01000000...\"}"
+curl -s -X POST BASE/{user_token}/broadcast -H "Content-Type: application/json" -d "{\"raw_tx\":\"01000000...\"}"
+curl -s -X POST BASE/{admin_token}/api/broadcast -H "Content-Type: application/json" -d "{\"raw_tx\":\"01000000...\"}"</code></pre>
+          <p class="muted">Response includes <span class="mono">txid</span>, <span class="mono">transmitted</span>, and per-peer <span class="mono">results</span> with write confirmation. Requires P2P running and at least one connected peer. User path is <span class="mono">/broadcast</span>; admin may also use <span class="mono">/api/broadcast</span>.</p>
+          <p class="muted">User token: <span class="mono">/track</span> + <span class="mono">/healthz</span> + <span class="mono">/broadcast</span>. Admin token: web UI + <span class="mono">/api</span>. Shared IP whitelist = full access.</p>
           <h3>Double-spend flag in API data</h3>
           <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span>, <span class="mono">confirmed</span>, and <span class="mono">confirmations</span> (0-5, from headers/blocks after inclusion).</p>
           <h3>Header safeguard in API data</h3>
@@ -1493,6 +1506,47 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       showFlash("API access settings saved.", true);
       refreshAll();
     } catch (e) { showFlash(e.message, false); }
+  });
+
+  $("#form-broadcast").addEventListener("submit", async function(ev) {
+    ev.preventDefault();
+    var hex = ($("#broadcast-hex").value || "").trim();
+    var box = $("#broadcast-result");
+    if (!box) return;
+    box.classList.remove("hidden");
+    box.innerHTML = '<p class="muted">Transmitting…</p>';
+    try {
+      var res = await api("/api/broadcast", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ raw_tx: hex })
+      });
+      var rows = (res.results || []).map(function(r) {
+        var st = r.ok
+          ? '<span class="pill">sent ' + escapeHtml(String(r.bytes_written || 0)) + ' B</span>'
+          : '<span class="pill warn">' + escapeHtml(r.error || "failed") + '</span>';
+        return '<tr><td data-label="Worker">' + escapeHtml(String(r.worker_id)) +
+          '</td><td data-label="Peer" class="mono">' + escapeHtml(r.peer || "") +
+          '</td><td data-label="Result">' + st + '</td></tr>';
+      }).join("");
+      var ok = !!res.transmitted;
+      box.innerHTML =
+        '<div class="msg ' + (ok ? "ok" : "err") + '">' +
+          (ok
+            ? ("Transmitted to " + escapeHtml(String(res.peers_sent)) + " of " + escapeHtml(String(res.peers_total)) + " peer(s).")
+            : "Not transmitted to any peer.") +
+          ' <span class="mono">txid=' + escapeHtml(res.txid || "") + "</span>" +
+          " · size " + escapeHtml(String(res.size_bytes || 0)) + " bytes" +
+        "</div>" +
+        '<div class="table-wrap"><table class="responsive"><thead><tr><th>Worker</th><th>Peer</th><th>Result</th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="3" class="muted">No peers connected.</td></tr>') +
+        "</tbody></table></div>";
+      if (ok) showFlash("Transaction transmitted: " + (res.txid || ""), true);
+      else showFlash("Broadcast failed: no peer accepted the write", false);
+    } catch (e) {
+      box.innerHTML = '<div class="msg err">' + escapeHtml(e.message || String(e)) + "</div>";
+      showFlash(e.message, false);
+    }
   });
 
   $("#btn-mempool-see-all").addEventListener("click", function() {

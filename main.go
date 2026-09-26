@@ -46,6 +46,7 @@ const (
 	NODE_WITNESS        = 1 << 3
 	GETDATA_BATCH       = 100
 	MAX_TX_FETCH_INV    = 500 // per inv; mark requested so large mempool dumps progress past this window
+	MAX_BROADCAST_TX_BYTES = 400000 // max raw signed tx accepted for /api/broadcast
 	MEMPOOL_RESYNC_SEC  = 90
 	MEMPOOL_WATCHER_SEC = 3
 	P2P_READ_IDLE_SEC   = 20
@@ -1500,6 +1501,197 @@ func (m *MetricsCollector) SetPeerSession(workerID int, addr string, connected b
 	}
 }
 
+// lockedConn serializes writes so P2P session traffic and /api/broadcast cannot interleave.
+type lockedConn struct {
+	net.Conn
+	wmu sync.Mutex
+}
+
+func (c *lockedConn) Write(b []byte) (int, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.Conn.Write(b)
+}
+
+func (c *lockedConn) WriteDeadline(b []byte, d time.Duration) (int, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(d))
+	n, err := c.Conn.Write(b)
+	_ = c.Conn.SetWriteDeadline(time.Time{})
+	return n, err
+}
+
+// PeerHub tracks live P2P worker connections for outbound tx broadcast.
+type PeerHub struct {
+	mu    sync.RWMutex
+	peers map[int]*lockedConn
+	addrs map[int]string
+}
+
+func NewPeerHub() *PeerHub {
+	return &PeerHub{
+		peers: make(map[int]*lockedConn),
+		addrs: make(map[int]string),
+	}
+}
+
+func (h *PeerHub) Register(workerID int, addr string, lc *lockedConn) {
+	if h == nil || lc == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.peers[workerID] = lc
+	h.addrs[workerID] = addr
+}
+
+func (h *PeerHub) Unregister(workerID int, lc *lockedConn) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cur, ok := h.peers[workerID]; ok && cur == lc {
+		delete(h.peers, workerID)
+		delete(h.addrs, workerID)
+	}
+}
+
+func (h *PeerHub) ConnectedCount() int {
+	if h == nil {
+		return 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.peers)
+}
+
+type peerBroadcastResult struct {
+	WorkerID     int    `json:"worker_id"`
+	Peer         string `json:"peer"`
+	OK           bool   `json:"ok"`
+	BytesWritten int    `json:"bytes_written,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+type BroadcastResult struct {
+	OK          bool                  `json:"ok"`
+	Transmitted bool                  `json:"transmitted"`
+	Txid        string                `json:"txid"`
+	SizeBytes   int                   `json:"size_bytes"`
+	PeersTotal  int                   `json:"peers_total"`
+	PeersSent   int                   `json:"peers_sent"`
+	PeersFailed int                   `json:"peers_failed"`
+	Results     []peerBroadcastResult `json:"results"`
+}
+
+func decodeRawTxHex(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\n', '\r', '\t':
+			return -1
+		default:
+			return r
+		}
+	}, s)
+	if s == "" {
+		return nil, errors.New("empty hex")
+	}
+	if len(s)%2 != 0 {
+		return nil, errors.New("hex length must be even")
+	}
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, errors.New("invalid hex")
+	}
+	if len(raw) < 10 {
+		return nil, errors.New("transaction too short")
+	}
+	if len(raw) > MAX_BROADCAST_TX_BYTES {
+		return nil, fmt.Errorf("transaction too large (max %d bytes)", MAX_BROADCAST_TX_BYTES)
+	}
+	if _, _, err := parseTxOutputs(raw); err != nil {
+		return nil, fmt.Errorf("invalid transaction: %v", err)
+	}
+	return raw, nil
+}
+
+func wireHashFromTxidHex(txid string) ([]byte, error) {
+	b, err := hex.DecodeString(txid)
+	if err != nil || len(b) != 32 {
+		return nil, errors.New("bad txid")
+	}
+	out := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		out[i] = b[31-i]
+	}
+	return out, nil
+}
+
+// BroadcastRawTx pushes a signed raw tx to every connected peer and returns per-peer write confirmation.
+func (h *PeerHub) BroadcastRawTx(raw []byte) BroadcastResult {
+	txid := txidHex(raw)
+	out := BroadcastResult{
+		Txid:      txid,
+		SizeBytes: len(raw),
+		Results:   []peerBroadcastResult{},
+	}
+	if h == nil {
+		return out
+	}
+
+	txMsg := buildMessage("tx", raw)
+	var invMsg []byte
+	if wh, err := wireHashFromTxidHex(txid); err == nil {
+		invMsg = buildMessage("inv", buildGetdataPayload([]invItem{{invType: MSG_TX, hash: wh}}))
+	}
+
+	type entry struct {
+		id   int
+		addr string
+		lc   *lockedConn
+	}
+	h.mu.RLock()
+	list := make([]entry, 0, len(h.peers))
+	for id, lc := range h.peers {
+		list = append(list, entry{id: id, addr: h.addrs[id], lc: lc})
+	}
+	h.mu.RUnlock()
+
+	out.PeersTotal = len(list)
+	for _, e := range list {
+		row := peerBroadcastResult{WorkerID: e.id, Peer: e.addr}
+		n, err := e.lc.WriteDeadline(txMsg, 20*time.Second)
+		if err != nil {
+			row.Error = err.Error()
+			out.PeersFailed++
+			out.Results = append(out.Results, row)
+			continue
+		}
+		if n != len(txMsg) {
+			row.Error = fmt.Sprintf("short write %d/%d", n, len(txMsg))
+			row.BytesWritten = n
+			out.PeersFailed++
+			out.Results = append(out.Results, row)
+			continue
+		}
+		row.OK = true
+		row.BytesWritten = n
+		out.PeersSent++
+		out.Results = append(out.Results, row)
+		// Best-effort inv so peers can gossip further; transmission confirmation is the tx write above.
+		if len(invMsg) > 0 {
+			_, _ = e.lc.WriteDeadline(invMsg, 10*time.Second)
+		}
+	}
+	out.Transmitted = out.PeersSent > 0
+	out.OK = out.Transmitted
+	return out
+}
+
 func (m *MetricsCollector) snapshotPeers() (rows []peerSession, connectedN int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1844,7 +2036,7 @@ func shufflePeerIPs(workerID int, ips []string) []string {
 // mempoolSniffer runs several parallel P2P sessions (like the arcade pup rotating seeds/peers)
 // so inv/getdata gossip reaches MemeTracker faster and more reliably than a single connection.
 // Closing stop unblocks workers between peers (active sessions may finish naturally up to SESSION_SEC).
-func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, parallel int, stop <-chan struct{}) {
+func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, parallel int, stop <-chan struct{}) {
 	if parallel < 1 {
 		parallel = 1
 	}
@@ -1855,7 +2047,7 @@ func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p
 		htrack = NewHeaderTracker("")
 	}
 	for w := 0; w < parallel; w++ {
-		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, stop)
+		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, peers, stop)
 	}
 }
 
@@ -1868,7 +2060,7 @@ func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {
 	}
 }
 
-func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, stop <-chan struct{}) {
+func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, stop <-chan struct{}) {
 	seeds, defaultPort := chooseSeeds(network)
 	if p2pPort == 0 {
 		p2pPort = defaultPort
@@ -1934,8 +2126,15 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 			_ = conn.SetDeadline(time.Time{})
 
 			stateLastPeer := net.JoinHostPort(peer, strconv.Itoa(p2pPort))
+			lc := &lockedConn{Conn: conn}
 			mcol.SetPeerSession(workerID, stateLastPeer, true)
-			memetrackerP2PSession(conn, stateLastPeer, store, processed, mcol, htrack, p2pPort, logf, logv)
+			if peers != nil {
+				peers.Register(workerID, stateLastPeer, lc)
+			}
+			memetrackerP2PSession(lc, stateLastPeer, store, processed, mcol, htrack, p2pPort, logf, logv)
+			if peers != nil {
+				peers.Unregister(workerID, lc)
+			}
 			mcol.SetPeerSession(workerID, stateLastPeer, false)
 			_ = conn.Close()
 		}
@@ -2644,7 +2843,7 @@ type MemeTrackerConfig struct {
 	P2PParallel    int      `json:"p2p_parallel"`
 	P2PLog         int      `json:"p2p_log"`
 	APIAllowedIPs  []string `json:"api_allowed_ips,omitempty"` // shared IP allowlist (full access when matched)
-	UserToken      string   `json:"user_token,omitempty"`       // user: /{token}/track/... and /{token}/healthz
+	UserToken      string   `json:"user_token,omitempty"`       // user: /{token}/track/... , /{token}/healthz, /{token}/broadcast
 	AdminToken     string   `json:"admin_token,omitempty"`      // admin: web UI + /api/* + everything
 	// APIToken is a legacy alias for UserToken (read from older memetracker_config.json).
 	APIToken string `json:"api_token,omitempty"`
@@ -2739,8 +2938,8 @@ func validateAPIToken(s string) error {
 		return errors.New("token must not contain /, ?, or #")
 	}
 	switch strings.ToLower(s) {
-	case "api", "track", "healthz", "logo.png", "static", "admin":
-		return errors.New("token cannot be a reserved path name (api, track, healthz, logo.png, admin)")
+	case "api", "track", "healthz", "logo.png", "static", "admin", "broadcast":
+		return errors.New("token cannot be a reserved path name (api, track, healthz, logo.png, admin, broadcast)")
 	}
 	return nil
 }
@@ -2828,7 +3027,7 @@ func requestWantsHTML(r *http.Request) bool {
 	if path == "/" || path == "" {
 		return true
 	}
-	if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/track/") || path == "/healthz" {
+	if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/track/") || path == "/healthz" || path == "/broadcast" {
 		return false
 	}
 	return true
@@ -2853,7 +3052,7 @@ h1{margin:0;color:#e85d5d;font-size:1.35rem;}
 }
 
 func pathIsUserAllowed(path string) bool {
-	return strings.HasPrefix(path, "/track/") || path == "/healthz"
+	return strings.HasPrefix(path, "/track/") || path == "/healthz" || path == "/broadcast"
 }
 
 func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
@@ -2882,7 +3081,7 @@ func apiAccessMiddleware(app *appState, next http.Handler) http.Handler {
 			}
 		}
 
-		// User token: /track/* and /healthz only.
+		// User token: /track/*, /healthz, and /broadcast only.
 		if hasUserTok {
 			if newPath, ok := stripAPITokenPrefix(r.URL.Path, userTok); ok {
 				if pathIsUserAllowed(newPath) {
@@ -2936,6 +3135,7 @@ type appState struct {
 	mcol         *MetricsCollector
 	htrack       *HeaderTracker
 	processed    *ProcessedSet
+	peers        *PeerHub
 	settingsPath string
 	httpPort     int
 	httpBind     string
@@ -2989,7 +3189,7 @@ func (a *appState) startP2P() {
 	cfg := a.snapshotCfg()
 	network := strings.ToLower(strings.TrimSpace(cfg.Network))
 	host := strings.TrimSpace(cfg.P2PHost)
-	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, cfg.P2PParallel, stopCh)
+	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, a.peers, cfg.P2PParallel, stopCh)
 	go runMetricsLoop(a.store, a.mcol, stopCh)
 	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=24h+resume)", network, cfg.P2PParallel)
 }
@@ -3235,6 +3435,41 @@ func apiDeleteTransaction(w http.ResponseWriter, r *http.Request, store *Store, 
 	}
 	processed.Remove(txid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func apiPostBroadcast(w http.ResponseWriter, r *http.Request, app *appState) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !app.isP2PRunning() {
+		writeJSONError(w, http.StatusServiceUnavailable, "P2P watcher is not running")
+		return
+	}
+	var body struct {
+		RawTx string `json:"raw_tx"`
+		Hex   string `json:"hex"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, MAX_BROADCAST_TX_BYTES*2+4096))
+	if err := dec.Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	rawHex := body.RawTx
+	if strings.TrimSpace(rawHex) == "" {
+		rawHex = body.Hex
+	}
+	raw, err := decodeRawTxHex(rawHex)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if app.peers == nil || app.peers.ConnectedCount() == 0 {
+		writeJSONError(w, http.StatusServiceUnavailable, "no connected peers to transmit to")
+		return
+	}
+	res := app.peers.BroadcastRawTx(raw)
+	writeJSON(w, http.StatusOK, res)
 }
 
 func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
@@ -3531,6 +3766,7 @@ func main() {
 		mcol:         mcol,
 		htrack:       htrack,
 		processed:    processed,
+		peers:        NewPeerHub(),
 		settingsPath: settingsPath,
 		httpPort:     publicPort,
 		httpBind:     bindIP,
@@ -3581,6 +3817,12 @@ func main() {
 	})
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
 		apiDeleteTransaction(w, r, app.store, app.processed)
+	})
+	mux.HandleFunc("/api/broadcast", func(w http.ResponseWriter, r *http.Request) {
+		apiPostBroadcast(w, r, app)
+	})
+	mux.HandleFunc("/broadcast", func(w http.ResponseWriter, r *http.Request) {
+		apiPostBroadcast(w, r, app)
 	})
 
 	mux.HandleFunc("/track/", func(w http.ResponseWriter, r *http.Request) {
