@@ -975,6 +975,13 @@ type Store struct {
 
 	watchByHash map[string]*AddressData // hash160hex -> data
 
+	// txIndex maps txid -> watched hash160 hexes that store that payment.
+	// Makes confirmation O(relevant addresses) instead of scanning every watcher.
+	txIndex map[string][]string
+
+	// unconfirmedCount is the number of stored payment rows with Confirmed=false.
+	unconfirmedCount int
+
 	mempoolKick atomic.Bool // set after /track/ so P2P loop sends "mempool" again
 }
 
@@ -1003,10 +1010,12 @@ func NewStore(storageDir string, listLimit int, retentionDays int) (*Store, erro
 		listLimit:     listLimit,
 		retentionDays: retentionDays,
 		watchByHash:   make(map[string]*AddressData),
+		txIndex:       make(map[string][]string),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	s.rebuildIndexesLocked()
 	s.purgeExpiredLocked(time.Now())
 	return s, nil
 }
@@ -1063,8 +1072,81 @@ func (s *Store) load() error {
 func (s *Store) purgeExpiredLocked(now time.Time) {
 	for hashHex, ad := range s.watchByHash {
 		if now.Sub(ad.LastRequested) > time.Duration(s.retentionDays)*24*time.Hour {
+			s.dropAddressIndexLocked(hashHex, ad)
 			delete(s.watchByHash, hashHex)
 			_ = os.Remove(s.fileForHash(hashHex))
+		}
+	}
+}
+
+func (s *Store) rebuildIndexesLocked() {
+	s.txIndex = make(map[string][]string)
+	s.unconfirmedCount = 0
+	for hashHex, ad := range s.watchByHash {
+		for _, tx := range ad.Txs {
+			if tx.Txid == "" {
+				continue
+			}
+			s.indexAddLocked(tx.Txid, hashHex)
+			if !tx.Confirmed {
+				s.unconfirmedCount++
+			}
+		}
+	}
+}
+
+func (s *Store) indexAddLocked(txid, hashHex string) {
+	if txid == "" || hashHex == "" {
+		return
+	}
+	refs := s.txIndex[txid]
+	for _, h := range refs {
+		if h == hashHex {
+			return
+		}
+	}
+	s.txIndex[txid] = append(refs, hashHex)
+}
+
+func (s *Store) indexRemoveLocked(txid, hashHex string) {
+	refs := s.txIndex[txid]
+	if len(refs) == 0 {
+		return
+	}
+	out := refs[:0]
+	for _, h := range refs {
+		if h != hashHex {
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		delete(s.txIndex, txid)
+		return
+	}
+	s.txIndex[txid] = out
+}
+
+func (s *Store) dropAddressIndexLocked(hashHex string, ad *AddressData) {
+	if ad == nil {
+		return
+	}
+	for _, tx := range ad.Txs {
+		s.indexRemoveLocked(tx.Txid, hashHex)
+		if !tx.Confirmed {
+			s.unconfirmedCount--
+		}
+	}
+	if s.unconfirmedCount < 0 {
+		s.unconfirmedCount = 0
+	}
+}
+
+func (s *Store) dropTxLocked(hashHex string, tx TxRecord) {
+	s.indexRemoveLocked(tx.Txid, hashHex)
+	if !tx.Confirmed {
+		s.unconfirmedCount--
+		if s.unconfirmedCount < 0 {
+			s.unconfirmedCount = 0
 		}
 	}
 }
@@ -1166,7 +1248,12 @@ func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge floa
 
 	// Store newest first.
 	ad.Txs = append([]TxRecord{rec}, ad.Txs...)
+	s.indexAddLocked(txid, hashHex)
+	s.unconfirmedCount++
 	if len(ad.Txs) > s.listLimit {
+		for _, dropped := range ad.Txs[s.listLimit:] {
+			s.dropTxLocked(hashHex, dropped)
+		}
 		ad.Txs = ad.Txs[:s.listLimit]
 	}
 	_ = s.persistAddressLocked(ad)
@@ -1183,8 +1270,16 @@ func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool 
 	confs := confirmationsFromHeights(blockHeight, tipHeight)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	refs := s.txIndex[txid]
+	if len(refs) == 0 {
+		return false
+	}
 	newlyConfirmed := false
-	for _, ad := range s.watchByHash {
+	for _, hashHex := range refs {
+		ad := s.watchByHash[hashHex]
+		if ad == nil {
+			continue
+		}
 		adChanged := false
 		for i := range ad.Txs {
 			if ad.Txs[i].Txid != txid {
@@ -1195,6 +1290,10 @@ func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool 
 				tx.Confirmed = true
 				newlyConfirmed = true
 				adChanged = true
+				s.unconfirmedCount--
+				if s.unconfirmedCount < 0 {
+					s.unconfirmedCount = 0
+				}
 			}
 			if blockHeight >= 0 && (tx.BlockHeight <= 0 || tx.BlockHeight > blockHeight) {
 				tx.BlockHeight = blockHeight
@@ -1222,28 +1321,15 @@ func (s *Store) KnowsTxid(txid string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, ad := range s.watchByHash {
-		for _, tx := range ad.Txs {
-			if tx.Txid == txid {
-				return true
-			}
-		}
-	}
-	return false
+	_, ok := s.txIndex[txid]
+	return ok
 }
 
 // HasUnconfirmedTxs is true when any stored payment was never seen in a scanned block body.
 func (s *Store) HasUnconfirmedTxs() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, ad := range s.watchByHash {
-		for _, tx := range ad.Txs {
-			if !tx.Confirmed {
-				return true
-			}
-		}
-	}
-	return false
+	return s.unconfirmedCount > 0
 }
 
 // RefreshConfirmations updates confirmation counts for already-confirmed txs as tip advances.
@@ -1278,8 +1364,16 @@ func (s *Store) MarkTxDoubleSpent(txid string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	refs := s.txIndex[txid]
+	if len(refs) == 0 {
+		return false
+	}
 	changed := false
-	for _, ad := range s.watchByHash {
+	for _, hashHex := range refs {
+		ad := s.watchByHash[hashHex]
+		if ad == nil {
+			continue
+		}
 		adChanged := false
 		for i := range ad.Txs {
 			if ad.Txs[i].Txid == txid && !ad.Txs[i].DoubleSpent {
@@ -1327,8 +1421,11 @@ func (s *Store) SetLimits(listLimit, retentionDays int) {
 	defer s.mu.Unlock()
 	s.listLimit = listLimit
 	s.retentionDays = retentionDays
-	for _, ad := range s.watchByHash {
+	for hashHex, ad := range s.watchByHash {
 		if len(ad.Txs) > s.listLimit {
+			for _, dropped := range ad.Txs[s.listLimit:] {
+				s.dropTxLocked(hashHex, dropped)
+			}
 			ad.Txs = ad.Txs[:s.listLimit]
 			_ = s.persistAddressLocked(ad)
 		}
@@ -1338,9 +1435,11 @@ func (s *Store) SetLimits(listLimit, retentionDays int) {
 func (s *Store) RemoveAddress(hashHex string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.watchByHash[hashHex]; !ok {
+	ad, ok := s.watchByHash[hashHex]
+	if !ok {
 		return false
 	}
+	s.dropAddressIndexLocked(hashHex, ad)
 	delete(s.watchByHash, hashHex)
 	_ = os.Remove(s.fileForHash(hashHex))
 	s.kickMempoolResync()
@@ -1355,12 +1454,16 @@ func (s *Store) RemoveTx(hashHex, txid string) bool {
 		return false
 	}
 	out := ad.Txs[:0]
+	removed := false
 	for _, r := range ad.Txs {
-		if r.Txid != txid {
-			out = append(out, r)
+		if r.Txid == txid {
+			s.dropTxLocked(hashHex, r)
+			removed = true
+			continue
 		}
+		out = append(out, r)
 	}
-	if len(out) == len(ad.Txs) {
+	if !removed {
 		return false
 	}
 	ad.Txs = out
@@ -2047,10 +2150,77 @@ func shufflePeerIPs(workerID int, ips []string) []string {
 	return out
 }
 
+// BlockWorkQueue scans full block bodies off the P2P read loop so mempool
+// inv/tx handling is not stalled by confirmation walks.
+type BlockWorkQueue struct {
+	ch   chan []byte
+	stop <-chan struct{}
+}
+
+func NewBlockWorkQueue(buf int) *BlockWorkQueue {
+	if buf < 4 {
+		buf = 4
+	}
+	return &BlockWorkQueue{ch: make(chan []byte, buf)}
+}
+
+func (q *BlockWorkQueue) Submit(payload []byte) {
+	if q == nil || len(payload) == 0 {
+		return
+	}
+	cp := append([]byte(nil), payload...)
+	select {
+	case q.ch <- cp:
+		return
+	default:
+	}
+	// Bounded wait so a slow scanner does not permanently drop, but the P2P
+	// reader never blocks for long.
+	select {
+	case q.ch <- cp:
+	case <-time.After(100 * time.Millisecond):
+		log.Printf("[MTR-P2P] block scan queue full; dropping one block body (%d bytes)", len(cp))
+	}
+}
+
+func (q *BlockWorkQueue) Run(workers int, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, stop <-chan struct{}) {
+	if q == nil {
+		return
+	}
+	q.stop = stop
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	logf := func(format string, args ...any) {
+		log.Printf("[MTR-BLOCK] "+format, args...)
+	}
+	logv := func(format string, args ...any) {
+		log.Printf("[MTR-BLOCK:v] "+format, args...)
+	}
+	for i := 0; i < workers; i++ {
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case payload, ok := <-q.ch:
+					if !ok {
+						return
+					}
+					_ = handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
+				}
+			}
+		}()
+	}
+}
+
 // mempoolSniffer runs several parallel P2P sessions (like the arcade pup rotating seeds/peers)
 // so inv/getdata gossip reaches MemeTracker faster and more reliably than a single connection.
 // Closing stop unblocks workers between peers (active sessions may finish naturally up to SESSION_SEC).
-func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, parallel int, stop <-chan struct{}) {
+func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, blocks *BlockWorkQueue, parallel int, stop <-chan struct{}) {
 	if parallel < 1 {
 		parallel = 1
 	}
@@ -2061,7 +2231,7 @@ func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p
 		htrack = NewHeaderTracker("")
 	}
 	for w := 0; w < parallel; w++ {
-		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, peers, stop)
+		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, peers, blocks, stop)
 	}
 }
 
@@ -2074,7 +2244,7 @@ func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {
 	}
 }
 
-func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, stop <-chan struct{}) {
+func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, blocks *BlockWorkQueue, stop <-chan struct{}) {
 	seeds, defaultPort := chooseSeeds(network)
 	if p2pPort == 0 {
 		p2pPort = defaultPort
@@ -2145,7 +2315,7 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 			if peers != nil {
 				peers.Register(workerID, stateLastPeer, lc)
 			}
-			memetrackerP2PSession(lc, stateLastPeer, store, processed, mcol, htrack, p2pPort, logf, logv)
+			memetrackerP2PSession(lc, stateLastPeer, store, processed, mcol, htrack, blocks, p2pPort, logf, logv)
 			if peers != nil {
 				peers.Unregister(workerID, lc)
 			}
@@ -2351,12 +2521,14 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 			return nil // skip coinbase
 		}
 		txid := txidHex(txRaw)
-		// Confirm known mempool hits by txid even if output re-parse is skipped later.
+		// Fast path: confirm known mempool payments via txid index (O(1) lookup).
 		if store.KnowsTxid(txid) {
 			if store.NoteTxConfirmed(txid, blockH, tipH) {
 				confirmedNew++
 			}
+			return nil
 		}
+		// Slow path only for txs never seen in mempool: output → watchByHash lookup.
 		n := considerWatchedPayment(store, processed, mcol, txRaw, false, blockH, tipH, logf, logv)
 		hits += n
 		return nil
@@ -2377,7 +2549,7 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 	return nil
 }
 
-func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, p2pPort int, logf, logv func(string, ...any)) {
+func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, blocks *BlockWorkQueue, p2pPort int, logf, logv func(string, ...any)) {
 	if htrack == nil {
 		htrack = NewHeaderTracker("")
 	}
@@ -2617,9 +2789,14 @@ readLoop:
 			}
 
 		case "block":
-			logv("recv BLOCK payload_len=%d (backup scan)", len(payload))
-			_ = handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
-			// Keep walking sequentially after each body (multi-block bursts).
+			logv("recv BLOCK payload_len=%d (queued for async scan)", len(payload))
+			// Never scan the full body on the P2P reader thread.
+			if blocks != nil {
+				blocks.Submit(payload)
+			} else {
+				_ = handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
+			}
+			// Keep requesting the next sequential bodies while scanners work.
 			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
 				sessionExit = err
 				break readLoop
@@ -3211,9 +3388,11 @@ func (a *appState) startP2P() {
 	cfg := a.snapshotCfg()
 	network := strings.ToLower(strings.TrimSpace(cfg.Network))
 	host := strings.TrimSpace(cfg.P2PHost)
-	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, a.peers, cfg.P2PParallel, stopCh)
+	blockQ := NewBlockWorkQueue(24)
+	blockQ.Run(2, a.store, a.processed, a.mcol, a.htrack, stopCh)
+	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, a.peers, blockQ, cfg.P2PParallel, stopCh)
 	go runMetricsLoop(a.store, a.mcol, stopCh)
-	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=24h+resume)", network, cfg.P2PParallel)
+	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=sequential+async-blocks)", network, cfg.P2PParallel)
 }
 
 func (a *appState) stopP2P() {
