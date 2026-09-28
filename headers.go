@@ -123,8 +123,9 @@ func (h *HeaderTracker) SetNetwork(network string) {
 	h.network = n
 }
 
-// SetStartCheckpoint configures an optional cold-start locator. When tip is empty,
-// the checkpoint is used instead of genesis, and tip is seeded so getheaders starts there.
+// SetStartCheckpoint configures an optional cold-start locator. When tip is empty
+// or clearly behind the checkpoint (unknown height / lower height / genesis walk),
+// the tip is reset to the checkpoint so getheaders does not resume from genesis.
 // height may be -1 when unknown.
 func (h *HeaderTracker) SetStartCheckpoint(hashHex string, height int64) {
 	hashHex = strings.ToLower(strings.TrimSpace(hashHex))
@@ -148,21 +149,57 @@ func (h *HeaderTracker) SetStartCheckpoint(hashHex string, height int64) {
 	} else {
 		h.checkpointH = -1
 	}
-	// Seed tip only when we have nothing persisted yet.
-	if h.tipHash == "" {
-		h.tipHash = hashHex
-		h.tipHeight = h.checkpointH
-		h.tipTime = time.Time{}
-		h.tipHeader80 = nil
-		if h.checkpointH >= 0 {
-			h.byHash[hashHex] = &storedHeader{
-				HashHex: hashHex,
-				Height:  h.checkpointH,
+
+	needJump := false
+	switch {
+	case h.tipHash == "":
+		needJump = true
+	case h.tipHash == hashHex:
+		// Already on checkpoint; repair height if we know it and tip does not.
+		if h.checkpointH >= 0 && h.tipHeight < 0 {
+			h.tipHeight = h.checkpointH
+			if sh, ok := h.byHash[hashHex]; ok {
+				sh.Height = h.checkpointH
+			} else {
+				h.byHash[hashHex] = &storedHeader{HashHex: hashHex, Height: h.checkpointH}
+				h.order = append(h.order, hashHex)
 			}
-			h.order = append(h.order, hashHex)
+			h.saveTipLocked()
 		}
-		h.saveTipLocked()
+	case h.checkpointH >= 0 && (h.tipHeight < 0 || h.tipHeight < h.checkpointH):
+		needJump = true
+	case h.tipHeight < 0:
+		// Wandering without height (typically a genesis walk) — honor user checkpoint.
+		needJump = true
 	}
+	if needJump {
+		h.resetTipToCheckpointLocked(hashHex, h.checkpointH)
+	}
+}
+
+func (h *HeaderTracker) resetTipToCheckpointLocked(hashHex string, height int64) {
+	h.byHash = make(map[string]*storedHeader)
+	h.order = nil
+	h.scanned = make(map[string]struct{})
+	h.pending = make(map[string]time.Time)
+	h.tipHash = hashHex
+	h.tipHeight = height
+	h.tipTime = time.Time{}
+	h.tipHeader80 = nil
+	h.lastScannedHash = ""
+	h.lastScannedHeight = -1
+	h.lastScannedAt = time.Time{}
+	h.scanningHash = ""
+	h.scanningHeight = -1
+	h.scanningStarted = time.Time{}
+	h.headersSeen = 0
+	h.walkBackDone = false
+	h.byHash[hashHex] = &storedHeader{
+		HashHex: hashHex,
+		Height:  height,
+	}
+	h.order = []string{hashHex}
+	h.saveTipLocked()
 }
 
 func (h *HeaderTracker) genesisHashHex() string {
@@ -176,6 +213,22 @@ func (h *HeaderTracker) genesisHashHex() string {
 	}
 }
 
+// EnsureGenesisTipSeed seeds tip at network genesis (height 0) when there is no tip
+// and no configured checkpoint. That way the UI tip hash/height/time advance as
+// getheaders catch-up walks the chain, instead of height staying n/a forever.
+func (h *HeaderTracker) EnsureGenesisTipSeed() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.tipHash != "" || h.checkpointHash != "" {
+		return
+	}
+	g := h.genesisHashHex()
+	if g == "" {
+		return
+	}
+	h.resetTipToCheckpointLocked(g, 0)
+}
+
 func (h *HeaderTracker) coldStartLocatorHex() string {
 	if h.checkpointHash != "" {
 		return h.checkpointHash
@@ -183,11 +236,12 @@ func (h *HeaderTracker) coldStartLocatorHex() string {
 	return h.genesisHashHex()
 }
 
-// NeedsHeaderSync is true until we have a tip with a plausible height (cold start / empty disk).
+// NeedsHeaderSync is true until we have a tip with height and a real header
+// (cold start, checkpoint seed without header bytes yet, or empty disk).
 func (h *HeaderTracker) NeedsHeaderSync() bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.tipHash == "" || h.tipHeight < 0
+	return h.tipHash == "" || h.tipHeight < 0 || h.tipTime.IsZero() || len(h.tipHeader80) != 80
 }
 
 func headerHashHex(h80 []byte) string {
@@ -374,6 +428,12 @@ func (h *HeaderTracker) Snapshot() map[string]any {
 	if !h.lastScannedAt.IsZero() {
 		lastAt = h.lastScannedAt.UTC().Format(time.RFC3339)
 	}
+	var cpHeight any
+	if h.checkpointH >= 0 {
+		cpHeight = h.checkpointH
+	} else {
+		cpHeight = nil
+	}
 	return map[string]any{
 		"tip_hash":               h.tipHash,
 		"tip_height":             tipHeight,
@@ -392,6 +452,8 @@ func (h *HeaderTracker) Snapshot() map[string]any {
 		"last_scanned_utc":          lastAt,
 		"body_scan_cursor_hash":     h.lastScannedHash,
 		"body_scan_cursor_height":   lastH,
+		"start_checkpoint_hash":     h.checkpointHash,
+		"start_checkpoint_height":   cpHeight,
 		"retention":                 HEADER_RETENTION.String(),
 		"persist_path":              h.persistPath,
 		"resumed_from_disk":         h.loadedFromDisk,

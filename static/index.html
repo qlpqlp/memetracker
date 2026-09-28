@@ -566,6 +566,19 @@
           <h2>Effective configuration (read-only)</h2>
           <pre id="cfg-readonly" class="mono" style="margin:0;font-size:.78rem;white-space:pre-wrap;"></pre>
         </div>
+        <div class="card">
+          <h2>Header start checkpoint</h2>
+          <p class="muted">If tip is stuck near genesis or you want a fast catch-up, set a recent block hash + height, then apply. This jumps the header tip to that checkpoint (works while P2P is running). Leave hash empty and apply to clear the configured checkpoint (does not wipe an existing tip).</p>
+          <div class="form-grid">
+            <div style="grid-column:1/-1"><label>Checkpoint hash</label>
+              <input id="cfg-checkpoint-hash" type="text" class="mono" placeholder="cc4ea83ae0882b21a54912dc5fc288d02662cf95dee0adf48ca249da61fc0a3d"/>
+            </div>
+            <div><label>Checkpoint height</label>
+              <input id="cfg-checkpoint-height" type="number" min="-1" step="1" placeholder="6393155"/>
+            </div>
+          </div>
+          <p style="margin:1rem 0 0"><button type="button" class="btn btn-primary btn-with-icon" id="btn-apply-checkpoint"><span class="material-icons" aria-hidden="true">vertical_align_top</span><span>Apply checkpoint</span></button></p>
+        </div>
       </section>
 
       <section id="panel-addr" class="panel">
@@ -1372,6 +1385,17 @@ curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/js
       updateDashCharts();
 
       $("#cfg-readonly").textContent = JSON.stringify(st.config, null, 2);
+      window.__mtrFullConfig = st.full_config || {};
+      var cpHashEl = $("#cfg-checkpoint-hash");
+      var cpHEl = $("#cfg-checkpoint-height");
+      if (cpHashEl && document.activeElement !== cpHashEl) {
+        cpHashEl.value = (st.full_config && st.full_config.start_checkpoint_hash) || (hs.start_checkpoint_hash) || "";
+      }
+      if (cpHEl && document.activeElement !== cpHEl) {
+        var cph = (st.full_config && st.full_config.start_checkpoint_height);
+        if (cph == null || cph === "") cph = hs.start_checkpoint_height;
+        cpHEl.value = (cph != null && cph !== "") ? cph : "";
+      }
 
       var cfg = await api("/api/config");
       maybeFillConfigForms(st, cfg);
@@ -1611,6 +1635,45 @@ curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/js
   $("#form-allowlist").addEventListener("input", function() {
     formState.allowDirty = true;
   });
+
+  var btnApplyCp = $("#btn-apply-checkpoint");
+  if (btnApplyCp) {
+    btnApplyCp.addEventListener("click", async function() {
+      var fc = window.__mtrFullConfig || {};
+      var hash = (($("#cfg-checkpoint-hash") && $("#cfg-checkpoint-hash").value) || "").trim();
+      var heightRaw = (($("#cfg-checkpoint-height") && $("#cfg-checkpoint-height").value) || "").trim();
+      var height = -1;
+      if (heightRaw !== "") {
+        var n = parseInt(heightRaw, 10);
+        if (!isNaN(n)) height = n;
+      } else if (!hash) {
+        height = 0;
+      }
+      if (hash && hash.length !== 64) {
+        showFlash("Checkpoint hash must be 64 hex characters.", false);
+        return;
+      }
+      var body = Object.assign({}, fc, {
+        start_checkpoint_hash: hash,
+        start_checkpoint_height: height
+      });
+      try {
+        var r = await fetch(apiPath("/api/start"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify(body)
+        });
+        var t = await r.text();
+        var j = null;
+        try { j = JSON.parse(t); } catch (_) {}
+        if (!r.ok) throw new Error((j && j.error) || t);
+        showFlash((j && j.message) || "Checkpoint applied.", true);
+        refreshAll();
+      } catch (e) {
+        showFlash(e.message, false);
+      }
+    });
+  }
 
   $("#btn-stop").addEventListener("click", async function() {
     var ok = await confirmModal({

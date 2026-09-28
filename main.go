@@ -4276,8 +4276,16 @@ func (a *appState) snapshotCfg() MemeTrackerConfig {
 
 func (a *appState) setCfg(c MemeTrackerConfig) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.cfg = c
+	a.mu.Unlock()
+	if a.store != nil {
+		a.store.SetNetwork(c.Network)
+	}
+	if a.htrack != nil {
+		a.htrack.SetNetwork(c.Network)
+		a.htrack.SetStartCheckpoint(c.StartCheckpointHash, c.StartCheckpointHeight)
+		a.htrack.EnsureGenesisTipSeed()
+	}
 }
 
 func (a *appState) isP2PRunning() bool {
@@ -4303,6 +4311,7 @@ func (a *appState) startP2P() {
 	if a.htrack != nil {
 		a.htrack.SetNetwork(network)
 		a.htrack.SetStartCheckpoint(cfg.StartCheckpointHash, cfg.StartCheckpointHeight)
+		a.htrack.EnsureGenesisTipSeed()
 	}
 	host := strings.TrimSpace(cfg.P2PHost)
 	if a.bloomPeers == nil {
@@ -4698,6 +4707,18 @@ func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if app.isP2PRunning() {
+		msg := "Config saved."
+		if strings.TrimSpace(body.StartCheckpointHash) != "" {
+			msg = "Config saved; header tip jumped to start checkpoint (getheaders will continue from there)."
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":          true,
+			"p2p_running": true,
+			"message":     msg,
+		})
+		return
+	}
 	app.startP2P()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "p2p_running": true})
 }
@@ -4913,6 +4934,10 @@ func main() {
 		}
 	}
 	htrack.SetStartCheckpoint(effectiveCfg.StartCheckpointHash, effectiveCfg.StartCheckpointHeight)
+	htrack.EnsureGenesisTipSeed()
+	if tip := htrack.TipHash(); tip != "" {
+		log.Printf("[MTR] header tip ready hash=%s height=%d path=%s", tip, htrack.TipHeight(), filepath.Join(storageDir, headerTipFileName))
+	}
 	if envTok := normalizeAPIToken(firstNonEmpty(os.Getenv("MTR_USER_TOKEN"), os.Getenv("MTR_API_TOKEN"))); envTok != "" {
 		if err := validateAPIToken(envTok); err != nil {
 			log.Fatalf("invalid user token env: %v", err)
