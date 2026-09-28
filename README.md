@@ -4,16 +4,18 @@
 
 MemeTracker allows you to detect payments in ~3 seconds so you can use it in your business to accept Dogecoin payments, detect them quickly, and confirm later while your customer sits down and enjoys their coffee.
 
-MemeTracker is a **Dogecoin mempool watcher**: it connects to the public P2P network (or your own node), requests the mempool, and follows `inv` / `getdata` / `tx` traffic. **Mempool is always first priority.** Headers/tip-block scans are only a backup when a payment skips mempool relay and is mined immediately. When a transaction pays one of your tracked **P2PKH** addresses (classic base58, e.g. mainnet addresses starting with `D`), it records the txid, timestamp, DOGE amount, and double-spend flag, and can call an optional HTTP callback.
+MemeTracker is a **Dogecoin mempool watcher**: it connects to the public P2P network (or your own node), requests the mempool, and follows `inv` / `getdata` / `tx` traffic. **Mempool is always first priority.** Headers plus BIP-37 filtered blocks (SPV-style, like dogecoin-wallet) confirm inclusion without downloading every full block body. When a transaction pays one of your tracked **P2PKH** addresses (classic base58, e.g. mainnet addresses starting with `D`), it records the txid, **vout / UTXO** (`txid:vout`), timestamp, DOGE amount, and double-spend flag, and can call an optional HTTP callback.
 
 ## How it works
 
 1. **P2P (mempool, priority 1)** - Several parallel sessions (default 3, configurable) connect to DNS seeds or `P2P_HOST`, complete version handshake, send `mempool`, then handle `inv` (transaction inventory), request bodies with `getdata`, and parse `tx` payloads. This path must not be starved.
-2. **P2P (header backup, priority 2)** - Tracks tip headers (`sendheaders` / `getheaders`), persists tip + **body-scan cursor** to `{storage}/header_tip.json`, and downloads block bodies **sequentially** from that cursor toward tip (never skips intermediates; resumes after restart). Full block walks run on **async workers** so they cannot stall mempool `inv`/`tx` handling. Confirmation uses a **txid index** (O(1) lookup), not a scan of every watched address.
-3. **Parsing** - Outputs are scanned for P2PKH / P2SH / v0 P2WPKH patterns; amounts going to a watched **hash160** are summed per transaction.
+2. **P2P (confirmations, priority 2)** - Tracks tip headers. Config `confirm_mode`:
+   - **`msg_block`** (default) — full block bodies from any peer; full mempool relay for the dashboard graph.
+   - **`node_bloom`** — only keep peers advertising **NODE_BLOOM** (like dogecoin-wallet `setRequiredServices(NODE_BLOOM)`). For confirms: temporary `filterload` → `MSG_FILTERED_BLOCK` → `filterclear` so the **mempool dashboard stays full**. Remembers bloom-capable peers for faster reconnect.
+3. **Parsing** - Outputs are scanned for P2PKH / P2SH / v0 P2WPKH patterns; each matching output is stored as its own payment row with **`vout`** and **`utxo`** (`txid:vout`).
 4. **Double-spend detection** - Inputs are tracked by outpoint (`prev_txid:vout`) during live mempool observation. If multiple txids spend the same outpoint in the active tracking window, those tx rows are marked as `double_spent = true`. Block-scan hits do not invent mempool conflicts.
 5. **Storage** - Each watched address has a JSON file under `{storage}/addresses/{hash160}.json`. Transactions are capped per address (`list_limit`) and addresses expire after `retention_days` without a refresh via `GET/POST /track/<address>`.
-6. **HTTP** - A local server (default port **33555**) serves the dashboard, JSON APIs, and `/track/` for automation.
+6. **HTTP** - A local server (default port **33555**) serves the dashboard, JSON APIs, and `/track/` for automation. Old stuck rows can be marked confirmed via the UI / `POST /api/transactions/confirm`.
 
 Observed **mempool tx count** in the UI is the number of **unique txids** recently seen on the wire (from `inv` and `tx`), which approximates relay visibility, not necessarily the same as `getrawmempool` on a full node. Dashboard **header safeguard** fields show tip hash/time, headers kept, blocks scanned, and payments first seen via blocks.
 
@@ -134,6 +136,7 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 | POST | `/broadcast` | Same body/response as `/api/broadcast` (user-facing path; also usable by admin/IP). |
 | DELETE | `/api/addresses/{hash160_hex}` | Untrack address and delete its file |
 | DELETE | `/api/transactions?txid=...&hash160_hex=...` | Remove one stored tx row |
+| POST | `/api/transactions/confirm` | Mark a stored payment confirmed (JSON `{ "txid", "hash160_hex" }`) — for old txs outside catch-up |
 | GET/POST | `/track/{P2PKH}` | Start or refresh tracking (503 if P2P not running); optional `callback` query / `X-Callback-Url` |
 | GET/POST | `/{admin_token}/` | Admin: web UI + all routes |
 | GET/POST | `/{user_token}/track/{P2PKH}` | User: track address |
@@ -144,14 +147,20 @@ Favicon and header use the official Silly Pups MemeTracker asset [static/logo.pn
 `/api/status` transaction rows include:
 
 - `txid`
+- `vout` (output index creating this payment)
+- `utxo` (`txid:vout` outpoint — use with a private key to spend)
 - `address`
+- `from_address` (payer P2PKH derived from input scriptSig/witness pubkey when present; bloom and full-block paths)
+- `from_addresses` (all unique payer addresses for multi-input spends; omitted when empty)
 - `amount_doge`
 - `datetime`
 - `hash160_hex`
 - `double_spent` (`true` when a conflicting spend was detected in the current live mempool tracking window)
-- `confirmed` (`true` once the payment was seen in a scanned block)
-- `confirmations` (integer 0-5: header/block depth after inclusion; stays at 5 once deeper)
+- `confirmed` (`true` once the payment was seen in a scanned block / merkleblock)
+- `confirmations` (integer 0-5: header depth after inclusion; stays at 5 once deeper)
 - `block_height` (inclusion height when known)
+
+`/track/{address}` returns the same payment fields on each item in `transactions` (plus `from_address` / `from_addresses` when recoverable).
 
 `/api/status` also includes `header_safeguard`:
 

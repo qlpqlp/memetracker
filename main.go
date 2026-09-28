@@ -1,6 +1,6 @@
-// MemeTracker - Dogecoin mempool watcher (open source, MIT License; see LICENSE).
+﻿// MemeTracker - Dogecoin mempool watcher (open source, MIT License; see LICENSE).
 //
-// Copyright (c) Paulo Vidal · https://x.com/inevitable360 · Dogecoin Foundation Dev
+// Copyright (c) Paulo Vidal Â· https://x.com/inevitable360 Â· Dogecoin Foundation Dev
 //
 // Priority 1: mempool watching (mempool / inv / getdata / tx / ping) must not fail.
 // Priority 2: header tip tracking + rare tip-block scans as backup when a watched
@@ -35,7 +35,105 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/ripemd160"
 )
+
+const (
+	ConfirmModeMsgBlock  = "msg_block"
+	ConfirmModeNodeBloom = "node_bloom"
+)
+
+func normalizeConfirmMode(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case ConfirmModeNodeBloom, "bloom", "spv", "bip37":
+		return ConfirmModeNodeBloom
+	default:
+		return ConfirmModeMsgBlock
+	}
+}
+
+func confirmModeIsBloom(s string) bool {
+	return normalizeConfirmMode(s) == ConfirmModeNodeBloom
+}
+
+// bloomPeerCache remembers peers that advertised NODE_BLOOM so workers can dial them first
+// (same idea as bitcoinj PeerGroup.setRequiredServices(NODE_BLOOM) in dogecoin-wallet).
+type bloomPeerCache struct {
+	mu    sync.Mutex
+	addrs []string
+	max   int
+}
+
+func newBloomPeerCache() *bloomPeerCache {
+	return &bloomPeerCache{max: 64}
+}
+
+func (c *bloomPeerCache) Note(addr string) {
+	if c == nil {
+		return
+	}
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, a := range c.addrs {
+		if a == addr {
+			return
+		}
+	}
+	c.addrs = append([]string{addr}, c.addrs...)
+	if len(c.addrs) > c.max {
+		c.addrs = c.addrs[:c.max]
+	}
+}
+
+func (c *bloomPeerCache) Prefer(candidates []string) []string {
+	if c == nil || len(candidates) == 0 {
+		return candidates
+	}
+	c.mu.Lock()
+	known := append([]string(nil), c.addrs...)
+	c.mu.Unlock()
+	if len(known) == 0 {
+		return candidates
+	}
+	out := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, a := range known {
+		host, _, err := net.SplitHostPort(a)
+		if err != nil {
+			host = a
+		}
+		for _, cand := range candidates {
+			if cand == host || cand == a {
+				if _, ok := seen[cand]; ok {
+					continue
+				}
+				seen[cand] = struct{}{}
+				out = append(out, cand)
+			}
+		}
+	}
+	for _, cand := range candidates {
+		if _, ok := seen[cand]; ok {
+			continue
+		}
+		out = append(out, cand)
+	}
+	return out
+}
+
+func (c *bloomPeerCache) Count() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.addrs)
+}
 
 const (
 	MAGIC               = 0xC0C0C0C0
@@ -44,17 +142,18 @@ const (
 	MSG_TX              = 1 // inventory type for transactions (and MSG_TX|MSG_WITNESS_FLAG for segwit)
 	NODE_NETWORK        = 1 << 0
 	NODE_WITNESS        = 1 << 3
-	GETDATA_BATCH       = 100
-	MAX_TX_FETCH_INV    = 500 // per inv; mark requested so large mempool dumps progress past this window
+	// NODE_BLOOM is defined in bloom.go (BIP-111); used for SPV filtered-block confirms.
+	GETDATA_BATCH          = 100
+	MAX_TX_FETCH_INV       = 500 // per inv; mark requested so large mempool dumps progress past this window
 	MAX_BROADCAST_TX_BYTES = 400000 // max raw signed tx accepted for /api/broadcast
-	MEMPOOL_RESYNC_SEC  = 90
-	MEMPOOL_WATCHER_SEC = 3
-	P2P_READ_IDLE_SEC   = 20
-	SESSION_SEC         = 300
-	MAX_CONFIRMATIONS   = 5 // UI/API display cap for confirmation depth
-	MEMPOOL_UI_RECENT   = 20
-	MEMPOOL_PAGE_DEFAULT = 50
-	MEMPOOL_PAGE_MAX    = 100
+	MEMPOOL_RESYNC_SEC     = 90
+	MEMPOOL_WATCHER_SEC    = 3
+	P2P_READ_IDLE_SEC      = 20
+	SESSION_SEC            = 300
+	MAX_CONFIRMATIONS      = 5 // UI/API display cap for confirmation depth
+	MEMPOOL_UI_RECENT      = 20
+	MEMPOOL_PAGE_DEFAULT   = 50
+	MEMPOOL_PAGE_MAX       = 100
 )
 
 //go:embed static/*
@@ -169,6 +268,60 @@ func b58checkDecode(addr string) ([]byte, error) {
 	return payload, nil
 }
 
+func b58Encode(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	zeros := 0
+	for zeros < len(b) && b[zeros] == 0 {
+		zeros++
+	}
+	x := new(big.Int).SetBytes(b)
+	base := big.NewInt(58)
+	mod := new(big.Int)
+	var out []byte
+	for x.Sign() > 0 {
+		x.DivMod(x, base, mod)
+		out = append(out, b58Alphabet[mod.Int64()])
+	}
+	for i := 0; i < zeros; i++ {
+		out = append(out, '1')
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return string(out)
+}
+
+func b58checkEncode(ver byte, payload []byte) string {
+	raw := make([]byte, 1+len(payload))
+	raw[0] = ver
+	copy(raw[1:], payload)
+	sum := sha256d(raw)
+	return b58Encode(append(raw, sum[:4]...))
+}
+
+func hash160(data []byte) []byte {
+	h := sha256.Sum256(data)
+	r := ripemd160.New()
+	_, _ = r.Write(h[:])
+	return r.Sum(nil)
+}
+
+func p2pkhVersionForNetwork(network string) byte {
+	if strings.EqualFold(strings.TrimSpace(network), "testnet") {
+		return testnetP2PKHVersion
+	}
+	return mainnetP2PKHVersion
+}
+
+func encodeP2PKHAddress(h160 []byte, network string) string {
+	if len(h160) != 20 {
+		return ""
+	}
+	return b58checkEncode(p2pkhVersionForNetwork(network), h160)
+}
+
 func decodePayoutToHash160(address string, network string) ([]byte, error) {
 	wantVer := mainnetP2PKHVersion
 	if strings.ToLower(network) != "mainnet" {
@@ -187,7 +340,7 @@ func decodePayoutToHash160(address string, network string) ([]byte, error) {
 // ------- Tx parsing -------
 
 // maxVarIntSlice is the largest count we allow when advancing an offset into a buffer
-// (avoids uint64→int overflow that can make the offset negative and panic in readVarInt).
+// (avoids uint64â†’int overflow that can make the offset negative and panic in readVarInt).
 const maxVarIntSlice = uint64(32 * 1024 * 1024)
 
 func readVarInt(data []byte, off *int) (uint64, error) {
@@ -432,6 +585,210 @@ func parseTxInputOutpoints(raw []byte) ([]txInputOutpoint, error) {
 		off += 4
 	}
 	return out, nil
+}
+
+func isLikelyPubkey(b []byte) bool {
+	if len(b) == 33 && (b[0] == 0x02 || b[0] == 0x03) {
+		return true
+	}
+	if len(b) == 65 && b[0] == 0x04 {
+		return true
+	}
+	return false
+}
+
+// extractScriptPushes returns data pushes from a Bitcoin/Dogecoin script.
+func extractScriptPushes(script []byte) [][]byte {
+	var pushes [][]byte
+	i := 0
+	for i < len(script) {
+		op := script[i]
+		i++
+		switch {
+		case op == 0x00:
+			continue
+		case op >= 0x01 && op <= 0x4b:
+			n := int(op)
+			if i+n > len(script) {
+				return pushes
+			}
+			pushes = append(pushes, script[i:i+n])
+			i += n
+		case op == 0x4c: // OP_PUSHDATA1
+			if i >= len(script) {
+				return pushes
+			}
+			n := int(script[i])
+			i++
+			if i+n > len(script) {
+				return pushes
+			}
+			pushes = append(pushes, script[i:i+n])
+			i += n
+		case op == 0x4d: // OP_PUSHDATA2
+			if i+2 > len(script) {
+				return pushes
+			}
+			n := int(binary.LittleEndian.Uint16(script[i : i+2]))
+			i += 2
+			if i+n > len(script) {
+				return pushes
+			}
+			pushes = append(pushes, script[i:i+n])
+			i += n
+		case op == 0x4e: // OP_PUSHDATA4
+			if i+4 > len(script) {
+				return pushes
+			}
+			n := int(binary.LittleEndian.Uint32(script[i : i+4]))
+			i += 4
+			if n < 0 || i+n > len(script) {
+				return pushes
+			}
+			pushes = append(pushes, script[i:i+n])
+			i += n
+		default:
+			// Non-push opcode; continue scanning (rare in scriptSig).
+		}
+	}
+	return pushes
+}
+
+func isNullHash32(b []byte) bool {
+	if len(b) != 32 {
+		return false
+	}
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// extractSenderAddresses derives P2PKH Dogecoin addresses from input scriptSig /
+// witness pubkeys (HASH160). Works for classic P2PKH and P2WPKH spends when the
+// pubkey is present in the witnessed transaction. Coinbase and exotic scripts
+// may yield an empty result.
+func extractSenderAddresses(raw []byte, network string) (primary string, all []string) {
+	if len(raw) < 8 {
+		return "", nil
+	}
+	off := 0
+	if off+4 > len(raw) {
+		return "", nil
+	}
+	off += 4
+	isSegwit := false
+	if off+2 <= len(raw) && raw[off] == 0 && raw[off+1] == 1 {
+		isSegwit = true
+		off += 2
+	}
+	nin, err := readVarInt(raw, &off)
+	if err != nil || nin == 0 {
+		return "", nil
+	}
+	type vinData struct {
+		coinbase bool
+		script   []byte
+	}
+	vins := make([]vinData, 0, int(nin))
+	for i := 0; i < int(nin); i++ {
+		if off+36 > len(raw) {
+			return "", nil
+		}
+		prev := raw[off : off+32]
+		off += 36
+		slen, err := readVarInt(raw, &off)
+		if err != nil {
+			return "", nil
+		}
+		if !offsetFits(off, slen, len(raw)) {
+			return "", nil
+		}
+		script := make([]byte, int(slen))
+		copy(script, raw[off:off+int(slen)])
+		off += int(slen)
+		if off+4 > len(raw) {
+			return "", nil
+		}
+		off += 4
+		vins = append(vins, vinData{coinbase: isNullHash32(prev), script: script})
+	}
+	// Skip outputs.
+	nout, err := readVarInt(raw, &off)
+	if err != nil {
+		return "", nil
+	}
+	for i := 0; i < int(nout); i++ {
+		if off+8 > len(raw) {
+			return "", nil
+		}
+		off += 8
+		slen, err := readVarInt(raw, &off)
+		if err != nil {
+			return "", nil
+		}
+		if !offsetAdd(&off, slen, len(raw)) {
+			return "", nil
+		}
+	}
+	witnesses := make([][][]byte, int(nin))
+	if isSegwit {
+		for i := 0; i < int(nin); i++ {
+			nstk, err := readVarInt(raw, &off)
+			if err != nil {
+				return "", nil
+			}
+			stack := make([][]byte, 0, int(nstk))
+			for j := 0; j < int(nstk); j++ {
+				elen, err := readVarInt(raw, &off)
+				if err != nil {
+					return "", nil
+				}
+				if !offsetFits(off, elen, len(raw)) {
+					return "", nil
+				}
+				item := make([]byte, int(elen))
+				copy(item, raw[off:off+int(elen)])
+				off += int(elen)
+				stack = append(stack, item)
+			}
+			witnesses[i] = stack
+		}
+	}
+
+	seen := make(map[string]struct{})
+	addPubkey := func(pk []byte) {
+		if !isLikelyPubkey(pk) {
+			return
+		}
+		addr := encodeP2PKHAddress(hash160(pk), network)
+		if addr == "" {
+			return
+		}
+		if _, ok := seen[addr]; ok {
+			return
+		}
+		seen[addr] = struct{}{}
+		all = append(all, addr)
+	}
+
+	for i, vin := range vins {
+		if vin.coinbase {
+			continue
+		}
+		for _, push := range extractScriptPushes(vin.script) {
+			addPubkey(push)
+		}
+		for _, item := range witnesses[i] {
+			addPubkey(item)
+		}
+	}
+	if len(all) > 0 {
+		primary = all[0]
+	}
+	return primary, all
 }
 
 func txidHex(raw []byte) string {
@@ -728,7 +1085,7 @@ func hexSnippet(b []byte, max int) string {
 	if len(b) <= max {
 		return hex.EncodeToString(b)
 	}
-	return hex.EncodeToString(b[:max]) + fmt.Sprintf("…(%d more bytes)", len(b)-max)
+	return hex.EncodeToString(b[:max]) + fmt.Sprintf("â€¦(%d more bytes)", len(b)-max)
 }
 
 // Summarize our outgoing version payload (same layout as buildVersionPayload).
@@ -928,13 +1285,24 @@ func buildVersionPayload(p2pPort int) []byte {
 // ------- Store (file-backed DB) -------
 
 type TxRecord struct {
-	Txid          string  `json:"txid"`
-	Datetime      string  `json:"datetime"`
-	AmountDoge    float64 `json:"amount_doge"`
-	DoubleSpent   bool    `json:"double_spent"`
-	Confirmed     bool    `json:"confirmed"`
-	Confirmations int     `json:"confirmations"` // 0..MAX_CONFIRMATIONS (headers/blocks since inclusion)
-	BlockHeight   int64   `json:"block_height,omitempty"`
+	Txid           string   `json:"txid"`
+	Vout           uint32   `json:"vout"`
+	Utxo           string   `json:"utxo"` // txid:vout — spendable outpoint when the watcher holds the key
+	Datetime       string   `json:"datetime"`
+	AmountDoge     float64  `json:"amount_doge"`
+	DoubleSpent    bool     `json:"double_spent"`
+	Confirmed      bool     `json:"confirmed"`
+	Confirmations  int      `json:"confirmations"` // 0..MAX_CONFIRMATIONS (headers/blocks since inclusion)
+	BlockHeight    int64    `json:"block_height,omitempty"`
+	FromAddress    string   `json:"from_address,omitempty"`    // payer P2PKH derived from input pubkey(s)
+	FromAddresses  []string `json:"from_addresses,omitempty"` // all unique payer addresses when multi-input
+}
+
+func formatUtxo(txid string, vout uint32) string {
+	if txid == "" {
+		return ""
+	}
+	return txid + ":" + strconv.FormatUint(uint64(vout), 10)
 }
 
 func clampConfirmations(n int) int {
@@ -972,6 +1340,7 @@ type Store struct {
 	addressesDir  string
 	listLimit     int
 	retentionDays int
+	network       string // mainnet | testnet — used to encode payer P2PKH addresses
 
 	watchByHash map[string]*AddressData // hash160hex -> data
 
@@ -983,20 +1352,53 @@ type Store struct {
 	unconfirmedCount int
 
 	mempoolKick atomic.Bool // set after /track/ so P2P loop sends "mempool" again
+	bloomKick   atomic.Bool // set when watched set changes so peers reload BIP-37 filter
+}
+
+func (s *Store) SetNetwork(network string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.network = strings.ToLower(strings.TrimSpace(network))
+}
+
+func (s *Store) Network() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.network == "" {
+		return "mainnet"
+	}
+	return s.network
 }
 
 func (s *Store) kickMempoolResync() {
 	s.mempoolKick.Store(true)
+	s.bloomKick.Store(true)
 }
 
 func (s *Store) takeMempoolKick() bool {
 	return s.mempoolKick.Swap(false)
 }
 
+func (s *Store) takeBloomKick() bool {
+	return s.bloomKick.Swap(false)
+}
+
 func (s *Store) watcherCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.watchByHash)
+}
+
+// WatchedHash160Hexes returns all tracked hash160 hex strings (for BIP-37 bloom).
+func (s *Store) WatchedHash160Hexes() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.watchByHash))
+	for hx := range s.watchByHash {
+		out = append(out, hx)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func NewStore(storageDir string, listLimit int, retentionDays int) (*Store, error) {
@@ -1083,14 +1485,23 @@ func (s *Store) rebuildIndexesLocked() {
 	s.txIndex = make(map[string][]string)
 	s.unconfirmedCount = 0
 	for hashHex, ad := range s.watchByHash {
-		for _, tx := range ad.Txs {
+		changed := false
+		for i := range ad.Txs {
+			tx := &ad.Txs[i]
 			if tx.Txid == "" {
 				continue
+			}
+			if tx.Utxo == "" {
+				tx.Utxo = formatUtxo(tx.Txid, tx.Vout)
+				changed = true
 			}
 			s.indexAddLocked(tx.Txid, hashHex)
 			if !tx.Confirmed {
 				s.unconfirmedCount++
 			}
+		}
+		if changed {
+			_ = s.persistAddressLocked(ad)
 		}
 	}
 }
@@ -1218,7 +1629,7 @@ func (s *Store) UpsertTracking(address string, hash160 []byte, callbackURL strin
 	return false, ad.Txs, ad.CallbackURL, nil
 }
 
-func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge float64, doubleSpent bool) (inserted bool) {
+func (s *Store) AddTx(hashHex string, txid string, vout uint32, dt time.Time, amountDoge float64, doubleSpent bool, fromAddress string, fromAddresses []string) (inserted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ad, ok := s.watchByHash[hashHex]
@@ -1226,11 +1637,29 @@ func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge floa
 		return false
 	}
 
-	// Dedupe by txid within the stored limited window.
+	fromAddress = strings.TrimSpace(fromAddress)
+	if fromAddresses != nil {
+		fromAddresses = append([]string(nil), fromAddresses...)
+	}
+
+	// Dedupe by outpoint (txid:vout); one tx may create multiple UTXOs to the same address.
 	for i := range ad.Txs {
-		if ad.Txs[i].Txid == txid {
+		if ad.Txs[i].Txid == txid && ad.Txs[i].Vout == vout {
+			changed := false
 			if doubleSpent && !ad.Txs[i].DoubleSpent {
 				ad.Txs[i].DoubleSpent = true
+				changed = true
+			}
+			// Backfill payer when we re-see the raw tx (e.g. mempool then block).
+			if fromAddress != "" && ad.Txs[i].FromAddress == "" {
+				ad.Txs[i].FromAddress = fromAddress
+				changed = true
+			}
+			if len(fromAddresses) > 0 && len(ad.Txs[i].FromAddresses) == 0 {
+				ad.Txs[i].FromAddresses = fromAddresses
+				changed = true
+			}
+			if changed {
 				_ = s.persistAddressLocked(ad)
 			}
 			return false
@@ -1239,11 +1668,15 @@ func (s *Store) AddTx(hashHex string, txid string, dt time.Time, amountDoge floa
 
 	rec := TxRecord{
 		Txid:          txid,
+		Vout:          vout,
+		Utxo:          formatUtxo(txid, vout),
 		Datetime:      dt.UTC().Format(time.RFC3339),
 		AmountDoge:    amountDoge,
 		DoubleSpent:   doubleSpent,
 		Confirmed:     false,
 		Confirmations: 0,
+		FromAddress:   fromAddress,
+		FromAddresses: fromAddresses,
 	}
 
 	// Store newest first.
@@ -1313,6 +1746,50 @@ func (s *Store) NoteTxConfirmed(txid string, blockHeight, tipHeight int64) bool 
 		}
 	}
 	return newlyConfirmed
+}
+
+// MarkTxConfirmedManual marks a stored payment confirmed from the UI/API when the
+// inclusion block is older than the catch-up window (e.g. stale mempool row).
+func (s *Store) MarkTxConfirmedManual(hashHex, txid string, tipHeight int64) bool {
+	hashHex = strings.ToLower(strings.TrimSpace(hashHex))
+	txid = strings.TrimSpace(txid)
+	if hashHex == "" || txid == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ad := s.watchByHash[hashHex]
+	if ad == nil {
+		return false
+	}
+	changed := false
+	for i := range ad.Txs {
+		if ad.Txs[i].Txid != txid {
+			continue
+		}
+		tx := &ad.Txs[i]
+		if !tx.Confirmed {
+			tx.Confirmed = true
+			s.unconfirmedCount--
+			if s.unconfirmedCount < 0 {
+				s.unconfirmedCount = 0
+			}
+			changed = true
+		}
+		want := MAX_CONFIRMATIONS
+		if tx.BlockHeight > 0 && tipHeight >= 0 {
+			want = confirmationsFromHeights(tx.BlockHeight, tipHeight)
+		}
+		if tx.Confirmations != want {
+			tx.Confirmations = want
+			changed = true
+		}
+	}
+	if !changed {
+		return false
+	}
+	_ = s.persistAddressLocked(ad)
+	return true
 }
 
 func (s *Store) KnowsTxid(txid string) bool {
@@ -1497,17 +1974,26 @@ func (s *Store) FlattenTransactions() []map[string]any {
 	var rows []map[string]any
 	for _, ad := range s.watchByHash {
 		for _, tx := range ad.Txs {
-			rows = append(rows, map[string]any{
+			row := map[string]any{
 				"address":       ad.Address,
 				"hash160_hex":   ad.Hash160Hex,
 				"txid":          tx.Txid,
+				"vout":          tx.Vout,
+				"utxo":          tx.Utxo,
 				"datetime":      tx.Datetime,
 				"amount_doge":   tx.AmountDoge,
 				"double_spent":  tx.DoubleSpent,
 				"confirmed":     tx.Confirmed,
 				"confirmations": clampConfirmations(tx.Confirmations),
 				"block_height":  tx.BlockHeight,
-			})
+			}
+			if tx.FromAddress != "" {
+				row["from_address"] = tx.FromAddress
+			}
+			if len(tx.FromAddresses) > 0 {
+				row["from_addresses"] = tx.FromAddresses
+			}
+			rows = append(rows, row)
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -1556,7 +2042,7 @@ func (s *Store) metricsSnapshot() (watched int, totalTx int, latestPayment strin
 				latest = t
 				short := tx.Txid
 				if len(short) > 14 {
-					short = short[:8] + "…" + short[len(short)-4:]
+					short = short[:8] + "â€¦" + short[len(short)-4:]
 				}
 				latestPayment = fmt.Sprintf("%s  %.8f DOGE  %s", short, tx.AmountDoge, tx.Datetime)
 			}
@@ -2059,10 +2545,14 @@ type ProcessedSet struct {
 }
 
 type PaymentCallbackPayload struct {
-	Address    string  `json:"address"`
-	Txid       string  `json:"txid"`
-	AmountDoge float64 `json:"payment_amount"`
-	Datetime   string  `json:"datetime"`
+	Address       string   `json:"address"`
+	Txid          string   `json:"txid"`
+	Vout          uint32   `json:"vout"`
+	Utxo          string   `json:"utxo"`
+	AmountDoge    float64  `json:"payment_amount"`
+	Datetime      string   `json:"datetime"`
+	FromAddress   string   `json:"from_address,omitempty"`
+	FromAddresses []string `json:"from_addresses,omitempty"`
 }
 
 func notifyCallback(callbackURL string, payload PaymentCallbackPayload) {
@@ -2220,18 +2710,23 @@ func (q *BlockWorkQueue) Run(workers int, store *Store, processed *ProcessedSet,
 // mempoolSniffer runs several parallel P2P sessions (like the arcade pup rotating seeds/peers)
 // so inv/getdata gossip reaches MemeTracker faster and more reliably than a single connection.
 // Closing stop unblocks workers between peers (active sessions may finish naturally up to SESSION_SEC).
-func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, blocks *BlockWorkQueue, parallel int, stop <-chan struct{}) {
+func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, blocks *BlockWorkQueue, parallel int, confirmMode string, bloomPeers *bloomPeerCache, stop <-chan struct{}) {
 	if parallel < 1 {
 		parallel = 1
 	}
 	if parallel > 8 {
 		parallel = 8
 	}
+	confirmMode = normalizeConfirmMode(confirmMode)
 	if htrack == nil {
 		htrack = NewHeaderTracker("")
 	}
+	if bloomPeers == nil {
+		bloomPeers = newBloomPeerCache()
+	}
+	log.Printf("[MTR-P2P] confirm_mode=%s (msg_block=full bodies; node_bloom=BIP-37 SPV, require NODE_BLOOM peers)", confirmMode)
 	for w := 0; w < parallel; w++ {
-		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, peers, blocks, stop)
+		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, peers, blocks, confirmMode, bloomPeers, stop)
 	}
 }
 
@@ -2244,7 +2739,7 @@ func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {
 	}
 }
 
-func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, blocks *BlockWorkQueue, stop <-chan struct{}) {
+func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost string, p2pPort, p2pLog int, mcol *MetricsCollector, htrack *HeaderTracker, processed *ProcessedSet, peers *PeerHub, blocks *BlockWorkQueue, confirmMode string, bloomPeers *bloomPeerCache, stop <-chan struct{}) {
 	seeds, defaultPort := chooseSeeds(network)
 	if p2pPort == 0 {
 		p2pPort = defaultPort
@@ -2252,6 +2747,7 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 	if p2pHost != "" {
 		seeds = []string{p2pHost}
 	}
+	requireBloom := confirmModeIsBloom(confirmMode)
 	logf := func(format string, args ...any) {
 		if p2pLog <= 0 {
 			return
@@ -2284,9 +2780,17 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 			ips = ips[:12]
 		}
 
+		// Prefer known NODE_BLOOM peers first when in SPV mode (dogecoin-wallet style).
+		if requireBloom {
+			ips = bloomPeers.Prefer(ips)
+		}
 		// Stride peers by worker so parallel goroutines do not all dial the same IP at once
 		// (peers often drop duplicate inbound links from the same host).
 		shuffled := shufflePeerIPs(workerID, ips)
+		if requireBloom {
+			// Prefer again after shuffle so known bloom IPs stay early for this worker stride.
+			shuffled = bloomPeers.Prefer(shuffled)
+		}
 		for idx := workerID; idx < len(shuffled); idx += parallel {
 			select {
 			case <-stop:
@@ -2305,8 +2809,6 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 				mcol.SetPeerSession(workerID, "", false)
 				continue
 			}
-			// Do not SetDeadline on the whole conn: sessions run up to SESSION_SEC; a short
-			// absolute deadline caused peers to be abandoned and payments missed.
 			_ = conn.SetDeadline(time.Time{})
 
 			stateLastPeer := net.JoinHostPort(peer, strconv.Itoa(p2pPort))
@@ -2315,7 +2817,7 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 			if peers != nil {
 				peers.Register(workerID, stateLastPeer, lc)
 			}
-			memetrackerP2PSession(lc, stateLastPeer, store, processed, mcol, htrack, blocks, p2pPort, logf, logv)
+			memetrackerP2PSession(lc, stateLastPeer, store, processed, mcol, htrack, blocks, p2pPort, confirmMode, bloomPeers, logf, logv)
 			if peers != nil {
 				peers.Unregister(workerID, lc)
 			}
@@ -2332,7 +2834,7 @@ func mempoolP2PWorker(workerID, parallel int, store *Store, network, p2pHost str
 // considerWatchedPayment matches outputs against watched addresses and stores hits.
 // When fromMempool is true, double-spend tracking runs on inputs.
 // When fromMempool is false, blockHeight/tipHeight update confirmed + confirmations (0..5).
-// Returns how many new address rows were inserted.
+// Returns how many new address rows were inserted (one row per matching UTXO / vout).
 func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *MetricsCollector, raw []byte, fromMempool bool, blockHeight, tipHeight int64, logf, logv func(string, ...any)) int {
 	if len(raw) == 0 {
 		return 0
@@ -2358,20 +2860,25 @@ func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *Metrics
 		processed.Add(wtxid)
 	}()
 
-	amtByHash := make(map[string]int64)
+	type matchedOut struct {
+		hashHex string
+		vout    uint32
+		sats    int64
+	}
+	var matched []matchedOut
 	store.mu.RLock()
-	for _, o := range outs {
+	for i, o := range outs {
 		h160, ok := scriptPubKeyHash160(o.script)
 		if !ok {
 			continue
 		}
 		hashHex := hex.EncodeToString(h160)
 		if _, watching := store.watchByHash[hashHex]; watching {
-			amtByHash[hashHex] += o.valueSats
+			matched = append(matched, matchedOut{hashHex: hashHex, vout: uint32(i), sats: o.valueSats})
 		}
 	}
 	store.mu.RUnlock()
-	if len(amtByHash) == 0 {
+	if len(matched) == 0 {
 		return 0
 	}
 
@@ -2391,21 +2898,26 @@ func considerWatchedPayment(store *Store, processed *ProcessedSet, mcol *Metrics
 	}
 
 	dt := time.Now().UTC()
+	fromAddr, fromAddrs := extractSenderAddresses(raw, store.Network())
 	inserted := 0
-	for hashHex, sats := range amtByHash {
-		if sats <= 0 {
+	for _, m := range matched {
+		if m.sats <= 0 {
 			continue
 		}
-		amountDoge := float64(sats) / 1e8
-		if store.AddTx(hashHex, txid, dt, amountDoge, isDoubleSpent) {
+		amountDoge := float64(m.sats) / 1e8
+		if store.AddTx(m.hashHex, txid, m.vout, dt, amountDoge, isDoubleSpent, fromAddr, fromAddrs) {
 			inserted++
-			addr, cbURL, ok := store.CallbackTarget(hashHex)
+			addr, cbURL, ok := store.CallbackTarget(m.hashHex)
 			if ok && cbURL != "" {
 				go notifyCallback(cbURL, PaymentCallbackPayload{
-					Address:    addr,
-					Txid:       txid,
-					AmountDoge: amountDoge,
-					Datetime:   dt.Format(time.RFC3339),
+					Address:       addr,
+					Txid:          txid,
+					Vout:          m.vout,
+					Utxo:          formatUtxo(txid, m.vout),
+					AmountDoge:    amountDoge,
+					Datetime:      dt.Format(time.RFC3339),
+					FromAddress:   fromAddr,
+					FromAddresses: fromAddrs,
 				})
 			}
 		}
@@ -2434,10 +2946,11 @@ func sendGetHeaders(conn net.Conn, htrack *HeaderTracker, logf, logv func(string
 }
 
 func queueBlockFetches(conn net.Conn, htrack *HeaderTracker, hashHexes []string, logf, logv func(string, ...any)) error {
-	return queueBlockFetchesOpt(conn, htrack, hashHexes, true, logf, logv)
+	_, err := queueBlockFetchesOpt(conn, htrack, hashHexes, true, false, logf, logv)
+	return err
 }
 
-func queueBlockFetchesOpt(conn net.Conn, htrack *HeaderTracker, hashHexes []string, requireWant bool, logf, logv func(string, ...any)) error {
+func queueBlockFetchesOpt(conn net.Conn, htrack *HeaderTracker, hashHexes []string, requireWant bool, filtered bool, logf, logv func(string, ...any)) ([]string, error) {
 	pending := make([]string, 0, MAX_BLOCK_FETCH_INV)
 	for _, hx := range hashHexes {
 		if requireWant && !htrack.WantBlockBody(hx) {
@@ -2455,42 +2968,98 @@ func queueBlockFetchesOpt(conn net.Conn, htrack *HeaderTracker, hashHexes []stri
 		}
 	}
 	if len(pending) == 0 {
-		return nil
+		return nil, nil
 	}
-	pl := buildBlockGetdata(pending)
+	pl := buildBlockGetdata(pending, filtered)
 	if len(pl) == 0 {
 		for _, hx := range pending {
 			htrack.ClearPending(hx)
 		}
-		return nil
+		return nil, nil
 	}
 	if _, err := conn.Write(buildMessage("getdata", pl)); err != nil {
 		for _, hx := range pending {
 			htrack.ClearPending(hx)
 		}
-		return err
+		return nil, err
 	}
-	logf("getdata blocks n=%d sequential=%v", len(pending), !requireWant)
-	return nil
+	if filtered {
+		logf("getdata filtered blocks (SPV merkleblock) n=%d sequential=%v", len(pending), !requireWant)
+	} else {
+		logf("getdata blocks n=%d sequential=%v", len(pending), !requireWant)
+	}
+	return pending, nil
 }
 
-// queueSequentialBlockBodies downloads the next unscanned bodies after the persisted
-// cursor toward tip (oldest first). Never jumps to tip when intermediates remain.
-func queueSequentialBlockBodies(conn net.Conn, store *Store, htrack *HeaderTracker, logf, logv func(string, ...any)) error {
+// queueBlockScanFetch chooses tip-only SPV when idle, or sequential no-skip catch-up
+// when unconfirmed payments still need inclusion proof.
+func queueBlockScanFetch(conn net.Conn, store *Store, htrack *HeaderTracker, filtered bool, logf, logv func(string, ...any)) ([]string, error) {
 	if store == nil || htrack == nil {
-		return nil
+		return nil, nil
 	}
-	needBodies := store.watcherCount() > 0 || store.HasUnconfirmedTxs()
-	if !needBodies {
+	if n := htrack.ExpireStalePending(); n > 0 {
+		logf("expired stale block getdata n=%d (no body/merkleblock in %s)", n, PENDING_BLOCK_TIMEOUT)
+		if filtered {
+			// Tell caller via log; session sets forceFullCatchup when expire happens during bloom.
+			logf("bloom filtered getdata timed out — will fall back to MSG_BLOCK")
+		}
+	}
+	watching := store.watcherCount() > 0
+	needConfirm := store.HasUnconfirmedTxs()
+	if !watching && !needConfirm {
 		htrack.AdvanceBodyCursorToTip()
-		return nil
+		return nil, nil
 	}
-	hashes := htrack.NextSequentialBodyHashes(MAX_BLOCK_FETCH_INV)
-	if len(hashes) == 0 {
-		return nil
+
+	// Unconfirmed payments: sequential catch-up from cursor toward tip. Never skip
+	// intermediate headers we still have; if the ring has a gap, snap past it.
+	if needConfirm {
+		limit := MAX_BLOCK_FETCH_INV
+		if filtered {
+			limit = 1 // one merkleblock at a time — fast SPV, no pending pile
+		} else {
+			limit = 1 // one full body at a time when falling back
+		}
+		hashes := htrack.NextSequentialBodyHashesNoSkip(limit)
+		if len(hashes) == 0 {
+			if ok, fromH, toH := htrack.SnapPastHeaderGap(); ok {
+				logf("confirm cursor snapped past missing header gap from=%d to=%d (use Mark confirmed for older txs)", fromH, toH)
+				hashes = htrack.NextSequentialBodyHashesNoSkip(limit)
+			}
+		}
+		if len(hashes) == 0 {
+			logv("sequential confirm catch-up idle (cursor caught up or waiting headers)")
+			return nil, nil
+		}
+		logf("sequential confirm catch-up n=%d filtered=%v first=%s last=%s", len(hashes), filtered, hashes[0], hashes[len(hashes)-1])
+		return queueBlockFetchesOpt(conn, htrack, hashes, false, filtered, logf, logv)
 	}
-	logv("sequential body scan queue n=%d first=%s last=%s", len(hashes), hashes[0], hashes[len(hashes)-1])
-	return queueBlockFetchesOpt(conn, htrack, hashes, false, logf, logv)
+
+	// Idle watch (no unconfirmed): keep cursor on tip.
+	// In NODE_BLOOM mode, still request tip merkleblock so mined-without-mempool payments are seen.
+	tip := htrack.TipHash()
+	if tip == "" {
+		return nil, nil
+	}
+	if htrack.AlreadyScanned(tip) {
+		htrack.AdvanceBodyCursorToTip()
+		return nil, nil
+	}
+	if filtered {
+		logv("tip SPV merkleblock fetch hash=%s (idle watch, NODE_BLOOM)", tip)
+		return queueBlockFetchesOpt(conn, htrack, []string{tip}, false, true, logf, logv)
+	}
+	htrack.AdvanceBodyCursorToTip()
+	return nil, nil
+}
+
+// queueTipBlockFetch / queueSequentialBlockBodies keep older names working.
+func queueTipBlockFetch(conn net.Conn, store *Store, htrack *HeaderTracker, filtered bool, logf, logv func(string, ...any)) ([]string, error) {
+	return queueBlockScanFetch(conn, store, htrack, filtered, logf, logv)
+}
+
+func queueSequentialBlockBodies(conn net.Conn, store *Store, htrack *HeaderTracker, filtered bool, logf, logv func(string, ...any)) ([]string, error) {
+	return queueBlockScanFetch(conn, store, htrack, filtered, logf, logv)
 }
 
 func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, payload []byte, logf, logv func(string, ...any)) []string {
@@ -2528,7 +3097,7 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 			}
 			return nil
 		}
-		// Slow path only for txs never seen in mempool: output → watchByHash lookup.
+		// Slow path only for txs never seen in mempool: output â†’ watchByHash lookup.
 		n := considerWatchedPayment(store, processed, mcol, txRaw, false, blockH, tipH, logf, logv)
 		hits += n
 		return nil
@@ -2549,18 +3118,211 @@ func handleBlockPayload(store *Store, processed *ProcessedSet, mcol *MetricsColl
 	return nil
 }
 
-func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, blocks *BlockWorkQueue, p2pPort int, logf, logv func(string, ...any)) {
+// handleMerkleBlockPayload processes a BIP-37 merkleblock (SPV path): confirm known
+// mempool payments from the partial merkle tree using header height, without a full body.
+// Returns how many matched txs the peer should still deliver as follow-up "tx" messages.
+func handleMerkleBlockPayload(store *Store, htrack *HeaderTracker, payload []byte, logf, logv func(string, ...any)) (hashHex string, height int64, matchedLeft int) {
+	mb, err := parseMerkleBlock(payload)
+	if err != nil {
+		logf("merkleblock parse failed: %v", err)
+		return "", -1, 0
+	}
+	hashHex, _ = htrack.RememberHeader80(mb.Header80)
+	if hashHex == "" {
+		return "", -1, 0
+	}
+	tipH := htrack.TipHeight()
+	store.RefreshConfirmations(tipH)
+	// Always drop pending for this hash — merkleblock IS the getdata response.
+	htrack.ClearPending(hashHex)
+	if htrack.AlreadyScanned(hashHex) {
+		return hashHex, -1, 0
+	}
+	blockH := htrack.HeaderHeight(hashHex)
+	if blockH < 0 && tipH >= 0 && hashHex == htrack.TipHash() {
+		blockH = tipH
+	}
+	htrack.SetScanning(hashHex, blockH)
+	confirmedNew := 0
+	for _, txid := range mb.MatchedTxid {
+		if store.KnowsTxid(txid) {
+			if store.NoteTxConfirmed(txid, blockH, tipH) {
+				confirmedNew++
+			}
+		}
+	}
+	matchedLeft = len(mb.MatchedTxid)
+	// Advance cursor immediately (SPV). Follow-up tx messages can still discover new payments.
+	htrack.MarkScanned(hashHex)
+	htrack.ClearScanning(hashHex)
+	if hashHex == htrack.TipHash() {
+		htrack.AdvanceBodyCursorToTip()
+	}
+	if confirmedNew > 0 {
+		htrack.AddConfirmedHits(confirmedNew)
+		logf("merkleblock SPV confirm hash=%s newly_confirmed=%d matched=%d height=%d", hashHex, confirmedNew, matchedLeft, blockH)
+	} else {
+		logf("merkleblock SPV scanned hash=%s matched=%d height=%d (no watched confirms)", hashHex, matchedLeft, blockH)
+	}
+	return hashHex, blockH, matchedLeft
+}
+
+func parsePeerServices(p []byte) uint64 {
+	if len(p) < 12 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(p[4:12])
+}
+
+func sendBloomFilter(conn net.Conn, store *Store, logf func(string, ...any)) error {
+	watched := store.WatchedHash160Hexes()
+	if len(watched) == 0 {
+		_, err := conn.Write(buildMessage("filterclear", nil))
+		if err == nil {
+			logf("sent FILTERCLEAR (no watched addresses)")
+		}
+		return err
+	}
+	tweak := uint32(time.Now().UnixNano() & 0xffffffff)
+	f := bloomFromWatched(watched, tweak)
+	msg := buildMessage("filterload", f.FilterloadPayload())
+	if _, err := conn.Write(msg); err != nil {
+		return err
+	}
+	logf("sent FILTERLOAD watched=%d filter_bytes=%d hash_funcs=%d (BIP-37 SPV)", len(watched), len(f.data), f.nHash)
+	return nil
+}
+
+// clearPendingFromNotfound clears block getdata pending entries reported in a notfound message.
+func clearPendingFromNotfound(htrack *HeaderTracker, payload []byte, logf func(string, ...any)) int {
+	items, err := parseInvPayload(payload)
+	if err != nil || len(items) == 0 {
+		return 0
+	}
+	n := 0
+	for _, it := range items {
+		if !invTypeIsBlock(it.invType) && (it.invType&^MSG_WITNESS_FLAG) != MSG_FILTERED_BLOCK {
+			continue
+		}
+		hx := reverseBytesToHex(it.hash)
+		htrack.ClearPending(hx)
+		n++
+	}
+	if n > 0 {
+		logf("notfound cleared pending block getdata n=%d", n)
+	}
+	return n
+}
+
+func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, processed *ProcessedSet, mcol *MetricsCollector, htrack *HeaderTracker, blocks *BlockWorkQueue, p2pPort int, confirmMode string, bloomPeers *bloomPeerCache, logf, logv func(string, ...any)) {
 	if htrack == nil {
 		htrack = NewHeaderTracker("")
 	}
+	confirmMode = normalizeConfirmMode(confirmMode)
+	bloomMode := confirmModeIsBloom(confirmMode)
 	gotVerack := false
 	mempoolSent := false
 	headersEnabled := false
+	peerServices := uint64(0)
+	peerBloom := false
+	filterLoaded := false
+	// After merkleblock, peer sends matched txs; count them as block inclusions.
+	merkleFollowLeft := 0
+	merkleFollowHash := ""
+	merkleFollowHeight := int64(-1)
 	lastMempoolResync := time.Time{}
 	lastGetHeaders := time.Time{}
 	lastTxActivity := time.Time{}
 	start := time.Now()
 	var sessionExit error
+	var sessionBlockPending []string
+
+	noteBlockPending := func(queued []string, err error) error {
+		if len(queued) > 0 {
+			sessionBlockPending = append(sessionBlockPending, queued...)
+		}
+		return err
+	}
+
+	defer func() {
+		htrack.ClearPendingMany(sessionBlockPending)
+	}()
+
+	clearBloom := func() {
+		if !filterLoaded {
+			return
+		}
+		_, _ = conn.Write(buildMessage("filterclear", nil))
+		filterLoaded = false
+		logv("sent FILTERCLEAR (restore full mempool relay)")
+	}
+
+	loadBloom := func() error {
+		watched := store.WatchedHash160Hexes()
+		if len(watched) == 0 {
+			clearBloom()
+			return nil
+		}
+		if err := sendBloomFilter(conn, store, logf); err != nil {
+			filterLoaded = false
+			return err
+		}
+		filterLoaded = true
+		return nil
+	}
+
+	forceFullCatchup := false // after filtered getdata times out / notfound, fall back to MSG_BLOCK
+	expireStreak := 0
+	queueScan := func() error {
+		if n := htrack.ExpireStalePending(); n > 0 {
+			expireStreak++
+			logf("expired stale block getdata n=%d streak=%d", n, expireStreak)
+			if bloomMode {
+				forceFullCatchup = true
+				logf("NODE_BLOOM catch-up falling back to MSG_BLOCK after timed-out filtered getdata")
+			}
+			// Old unconfirmed rows outside reachable bodies: stop spamming pending.
+			if expireStreak >= 2 && store.HasUnconfirmedTxs() {
+				logf("confirm catch-up stalled — advancing cursor to tip; Mark confirmed for remaining unconfirmed rows")
+				htrack.AdvanceBodyCursorToTip()
+				expireStreak = 0
+				return nil
+			}
+		} else {
+			expireStreak = 0
+		}
+
+		useFilt := bloomMode && peerBloom && !forceFullCatchup && len(store.WatchedHash160Hexes()) > 0
+		if useFilt {
+			if err := loadBloom(); err != nil {
+				logf("bloom filterload failed: %v — using MSG_BLOCK", err)
+				useFilt = false
+				forceFullCatchup = true
+			}
+		}
+		if useFilt {
+			logf("confirm catch-up MSG_FILTERED_BLOCK peer=%s (temporary bloom)", stateLastPeer)
+		} else if bloomMode && store.HasUnconfirmedTxs() {
+			logf("confirm catch-up MSG_BLOCK peer=%s forceFull=%v", stateLastPeer, forceFullCatchup)
+		}
+		queued, err := queueBlockScanFetch(conn, store, htrack, useFilt, logf, logv)
+		// Always clear bloom after getdata so mempool inv/tx relay resumes (dashboard graph).
+		// In-flight merkleblock/block responses still arrive for the getdata already sent.
+		clearBloom()
+		return noteBlockPending(queued, err)
+	}
+
+	finishMerkleFollow := func() {
+		if merkleFollowHash == "" {
+			return
+		}
+		if merkleFollowLeft <= 0 {
+			// Cursor already advanced when merkleblock arrived; just clear follow state.
+			merkleFollowHash = ""
+			merkleFollowHeight = -1
+			merkleFollowLeft = 0
+		}
+	}
 
 	logf("connected peer=%s handshake start (Dogecoin P2P magic_u32le=0x%x wire_magic_4b_le_hex=%s)", stateLastPeer, MAGIC, dogeMagicWireHexLE())
 	verOut := buildVersionPayload(p2pPort)
@@ -2583,10 +3345,11 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 		if store.watcherCount() == 0 {
 			return false
 		}
-		// With watchers, mempool always wins. Skip block backup until we have seen
-		// mempool traffic and then a quiet window (no recent tx/inv).
+		// Only pause header/catch-up briefly after real mempool traffic.
+		// Never treat "no tx seen yet" as busy — that starved getheaders when bloom
+		// had suppressed relay and left the scan cursor stuck.
 		if lastTxActivity.IsZero() {
-			return true
+			return false
 		}
 		return time.Since(lastTxActivity) < 20*time.Second
 	}
@@ -2595,8 +3358,11 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 		if !gotVerack || !headersEnabled {
 			return nil
 		}
-		// Sequential body scan from persisted cursor (handles multi-block bursts).
-		if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+		if store.takeBloomKick() {
+			// Never leave a filter loaded — MemeTracker needs full mempool for the UI.
+			clearBloom()
+		}
+		if err := queueScan(); err != nil {
 			return err
 		}
 		if mempoolBusy() {
@@ -2703,6 +3469,16 @@ readLoop:
 		case "version":
 			logf("recv VERSION from peer=%s - %s", stateLastPeer, summarizePeerVersionPayload(payload))
 			logv("peer version payload head hex=%s", hexSnippet(payload, 256))
+			peerServices = parsePeerServices(payload)
+			peerBloom = peerServices&NODE_BLOOM != 0
+			if bloomMode && !peerBloom {
+				sessionExit = fmt.Errorf("peer lacks NODE_BLOOM (confirm_mode=node_bloom)")
+				logf("skip peer=%s services=0x%x — no NODE_BLOOM (dogecoin-wallet requiredServices)", stateLastPeer, peerServices)
+				break readLoop
+			}
+			if peerBloom && bloomPeers != nil {
+				bloomPeers.Note(stateLastPeer)
+			}
 			htrack.NotePeerStartHeight(parsePeerStartHeight(payload))
 			ack := buildMessage("verack", nil)
 			_, werr := conn.Write(ack)
@@ -2711,11 +3487,12 @@ readLoop:
 				logf("write verack failed: %v", werr)
 				break readLoop
 			}
-			logf("sent VERACK (%d bytes) awaiting peer VERACK", len(ack))
+			logf("sent VERACK (%d bytes) awaiting peer VERACK (NODE_BLOOM=%v confirm_mode=%s)", len(ack), peerBloom, confirmMode)
 			logv("verack message hex=%s", hex.EncodeToString(ack))
 		case "verack":
 			gotVerack = true
-			logf("recv VERACK from peer=%s - handshake complete", stateLastPeer)
+			logf("recv VERACK from peer=%s - handshake complete confirm_mode=%s bloom=%v (mempool unfiltered; bloom only around SPV getdata)", stateLastPeer, confirmMode, peerBloom)
+			clearBloom()
 			if !headersEnabled {
 				if _, werr := conn.Write(buildMessage("sendheaders", nil)); werr != nil {
 					sessionExit = werr
@@ -2759,7 +3536,21 @@ readLoop:
 			mcol.noteTxBody(txidEarly)
 			lastTxActivity = time.Now()
 			logv("recv TX raw len=%d txid_le=%s", len(payload), txidEarly)
-			_ = considerWatchedPayment(store, processed, mcol, payload, true, -1, -1, logf, logv)
+			fromMempool := true
+			blockH, tipH := int64(-1), int64(-1)
+			if merkleFollowLeft > 0 && merkleFollowHash != "" {
+				fromMempool = false
+				blockH = merkleFollowHeight
+				tipH = htrack.TipHeight()
+				merkleFollowLeft--
+				n := considerWatchedPayment(store, processed, mcol, payload, false, blockH, tipH, logf, logv)
+				if n > 0 {
+					htrack.AddConfirmedHits(n)
+				}
+				finishMerkleFollow()
+			} else {
+				_ = considerWatchedPayment(store, processed, mcol, payload, fromMempool, blockH, tipH, logf, logv)
+			}
 
 		case "headers":
 			hdrs, err := decodeHeadersPayload(payload)
@@ -2773,7 +3564,7 @@ readLoop:
 			}
 			store.RefreshConfirmations(htrack.TipHeight())
 			// Sequential bodies after cursor (never tip-only when intermediates remain).
-			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+			if err := queueScan(); err != nil {
 				sessionExit = err
 				break readLoop
 			}
@@ -2788,6 +3579,31 @@ readLoop:
 				}
 			}
 
+		case "merkleblock":
+			logf("recv MERKLEBLOCK payload_len=%d peer=%s (SPV)", len(payload), stateLastPeer)
+			hx, height, left := handleMerkleBlockPayload(store, htrack, payload, logf, logv)
+			forceFullCatchup = false // filtered path works on this peer
+			if left > 0 {
+				merkleFollowHash = hx
+				merkleFollowHeight = height
+				merkleFollowLeft = left
+			}
+			if err := queueScan(); err != nil {
+				sessionExit = err
+				break readLoop
+			}
+
+		case "notfound":
+			n := clearPendingFromNotfound(htrack, payload, logf)
+			if n > 0 && bloomMode {
+				forceFullCatchup = true
+				logf("peer notfound for filtered/block getdata — falling back to MSG_BLOCK")
+				if err := queueScan(); err != nil {
+					sessionExit = err
+					break readLoop
+				}
+			}
+
 		case "block":
 			logv("recv BLOCK payload_len=%d (queued for async scan)", len(payload))
 			// Never scan the full body on the P2P reader thread.
@@ -2797,7 +3613,7 @@ readLoop:
 				_ = handleBlockPayload(store, processed, mcol, htrack, payload, logf, logv)
 			}
 			// Keep requesting the next sequential bodies while scanners work.
-			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+			if err := queueScan(); err != nil {
 				sessionExit = err
 				break readLoop
 			}
@@ -2891,8 +3707,8 @@ readLoop:
 				}
 			}
 
-			// Priority 2: sequential bodies from cursor (handles multi-block inv bursts).
-			if err := queueSequentialBlockBodies(conn, store, htrack, logf, logv); err != nil {
+			// Priority 2: confirm catch-up / tip maintenance (after mempool getdata).
+			if err := queueScan(); err != nil {
 				sessionExit = err
 				break readLoop
 			}
@@ -2911,29 +3727,27 @@ readLoop:
 				_, werr := conn.Write(buildMessage("mempool", nil))
 				if werr != nil {
 					sessionExit = werr
-					logf("periodic mempool write failed: %v", werr)
+					logf("write periodic mempool failed: %v", werr)
 					break readLoop
 				}
 				lastMempoolResync = time.Now()
-				logv("periodic MEMPOOL resent interval=%ds watchers=%d", interval, nw)
+				logv("mempool periodic watchers=%d", nw)
 			}
-		}
-		if err := maybeHeaderMaintenance(false); err != nil {
-			sessionExit = err
-			break readLoop
+			if store.takeBloomKick() {
+				clearBloom()
+			}
 		}
 	}
 
 	_ = conn.SetReadDeadline(time.Time{})
 	if sessionExit != nil {
-		logf("session end peer=%s gotVerack=%v mempoolSent=%v duration=%s err=%v",
-			stateLastPeer, gotVerack, mempoolSent, time.Since(start).Truncate(time.Millisecond), sessionExit)
+		logf("session end peer=%s gotVerack=%v mempoolSent=%v bloom=%v duration=%s err=%v",
+			stateLastPeer, gotVerack, mempoolSent, peerBloom, time.Since(start).Truncate(time.Millisecond), sessionExit)
 	} else {
-		logf("session end peer=%s gotVerack=%v mempoolSent=%v duration=%s (session cap %ds, no wire error)",
-			stateLastPeer, gotVerack, mempoolSent, time.Since(start).Truncate(time.Millisecond), SESSION_SEC)
+		logf("session end peer=%s gotVerack=%v mempoolSent=%v bloom=%v duration=%s (session cap %ds, no wire error)",
+			stateLastPeer, gotVerack, mempoolSent, peerBloom, time.Since(start).Truncate(time.Millisecond), SESSION_SEC)
 	}
 }
-
 func reverseBytesToHex(b []byte) string {
 	// Used to convert inventory hashes to the same endianness as txidHex() returns.
 	r := make([]byte, len(b))
@@ -3041,6 +3855,9 @@ type MemeTrackerConfig struct {
 	P2PPort        int      `json:"p2p_port"`
 	P2PParallel    int      `json:"p2p_parallel"`
 	P2PLog         int      `json:"p2p_log"`
+	// ConfirmMode: "msg_block" (default) = full block bodies from any peer;
+	// "node_bloom" = BIP-37 SPV like dogecoin-wallet (only peers advertising NODE_BLOOM).
+	ConfirmMode   string   `json:"confirm_mode,omitempty"`
 	APIAllowedIPs  []string `json:"api_allowed_ips,omitempty"` // shared IP allowlist (full access when matched)
 	UserToken      string   `json:"user_token,omitempty"`       // user: /{token}/track/... , /{token}/healthz, /{token}/broadcast
 	AdminToken     string   `json:"admin_token,omitempty"`      // admin: web UI + /api/* + everything
@@ -3078,7 +3895,8 @@ func (c *MemeTrackerConfig) ApplyDefaults() {
 	if c.P2PLog > 2 {
 		c.P2PLog = 2
 	}
-	// Migrate legacy api_token → user_token.
+	c.ConfirmMode = normalizeConfirmMode(c.ConfirmMode)
+	// Migrate legacy api_token â†’ user_token.
 	c.UserToken = normalizeAPIToken(c.UserToken)
 	c.APIToken = normalizeAPIToken(c.APIToken)
 	if c.UserToken == "" && c.APIToken != "" {
@@ -3335,6 +4153,7 @@ type appState struct {
 	htrack       *HeaderTracker
 	processed    *ProcessedSet
 	peers        *PeerHub
+	bloomPeers   *bloomPeerCache
 	settingsPath string
 	httpPort     int
 	httpBind     string
@@ -3387,12 +4206,16 @@ func (a *appState) startP2P() {
 
 	cfg := a.snapshotCfg()
 	network := strings.ToLower(strings.TrimSpace(cfg.Network))
+	a.store.SetNetwork(network)
 	host := strings.TrimSpace(cfg.P2PHost)
+	if a.bloomPeers == nil {
+		a.bloomPeers = newBloomPeerCache()
+	}
 	blockQ := NewBlockWorkQueue(24)
 	blockQ.Run(2, a.store, a.processed, a.mcol, a.htrack, stopCh)
-	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, a.peers, blockQ, cfg.P2PParallel, stopCh)
+	go mempoolSniffer(a.store, network, host, cfg.P2PPort, cfg.P2PLog, a.mcol, a.htrack, a.processed, a.peers, blockQ, cfg.P2PParallel, cfg.ConfirmMode, a.bloomPeers, stopCh)
 	go runMetricsLoop(a.store, a.mcol, stopCh)
-	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, header_safeguard=sequential+async-blocks)", network, cfg.P2PParallel)
+	log.Printf("[MTR] P2P mempool watcher started (network=%s, p2p_parallel=%d, confirm_mode=%s)", network, cfg.P2PParallel, normalizeConfirmMode(cfg.ConfirmMode))
 }
 
 func (a *appState) stopP2P() {
@@ -3497,6 +4320,7 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 		"p2p_port":        cfg.P2PPort,
 		"p2p_parallel":    cfg.P2PParallel,
 		"p2p_log":         cfg.P2PLog,
+		"confirm_mode":    normalizeConfirmMode(cfg.ConfirmMode),
 		"api_allowed_ips": allowCopy,
 		"user_token":      cfg.UserToken,
 		"admin_token":     cfg.AdminToken,
@@ -3504,6 +4328,10 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 	hs := map[string]any{}
 	if app.htrack != nil {
 		hs = app.htrack.Snapshot()
+	}
+	bloomKnown := 0
+	if app.bloomPeers != nil {
+		bloomKnown = app.bloomPeers.Count()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"p2p_running":               app.isP2PRunning(),
@@ -3516,6 +4344,8 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 		"peers_connected_count":     nConn,
 		"peers":                     peerOut,
 		"header_safeguard":          hs,
+		"confirm_mode":              normalizeConfirmMode(cfg.ConfirmMode),
+		"bloom_peers_known":         bloomKnown,
 		"addresses":                 app.store.ListAddressSnapshots(),
 		"transactions":              app.store.FlattenTransactions(),
 		"full_config":               fc,
@@ -3528,6 +4358,7 @@ func apiStatus(w http.ResponseWriter, r *http.Request, app *appState) {
 			"p2p_port":            cfg.P2PPort,
 			"p2p_parallel":        cfg.P2PParallel,
 			"p2p_log":             cfg.P2PLog,
+			"confirm_mode":        normalizeConfirmMode(cfg.ConfirmMode),
 			"list_limit":          ll,
 			"retention_days":      rd,
 			"settings_file_note":  "list_limit and retention_days sync to settings.json from the Configuration tab when saved",
@@ -3638,6 +4469,47 @@ func apiDeleteTransaction(w http.ResponseWriter, r *http.Request, store *Store, 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func apiConfirmTransaction(w http.ResponseWriter, r *http.Request, store *Store, htrack *HeaderTracker) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	txid := strings.TrimSpace(r.URL.Query().Get("txid"))
+	hashHex := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("hash160_hex")))
+	if r.Header.Get("Content-Type") != "" && strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		var body struct {
+			Txid       string `json:"txid"`
+			Hash160Hex string `json:"hash160_hex"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if strings.TrimSpace(body.Txid) != "" {
+			txid = strings.TrimSpace(body.Txid)
+		}
+		if strings.TrimSpace(body.Hash160Hex) != "" {
+			hashHex = strings.ToLower(strings.TrimSpace(body.Hash160Hex))
+		}
+	}
+	if txid == "" || hashHex == "" {
+		writeJSONError(w, http.StatusBadRequest, "txid and hash160_hex required")
+		return
+	}
+	tipH := int64(-1)
+	if htrack != nil {
+		tipH = htrack.TipHeight()
+	}
+	if !store.MarkTxConfirmedManual(hashHex, txid, tipH) {
+		writeJSONError(w, http.StatusNotFound, "transaction not found or already confirmed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"txid":          txid,
+		"hash160_hex":   hashHex,
+		"confirmed":     true,
+		"confirmations": MAX_CONFIRMATIONS,
+	})
+}
+
 func apiPostBroadcast(w http.ResponseWriter, r *http.Request, app *appState) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -3684,7 +4556,7 @@ func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
 		return
 	}
 	body.APIAllowedIPs = normalizeAPIAllowedIPs(body.APIAllowedIPs)
-	body.ApplyDefaults() // migrates legacy api_token → user_token
+	body.ApplyDefaults() // migrates legacy api_token â†’ user_token
 	if err := validateAPIToken(body.UserToken); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "user_token: "+err.Error())
 		return
@@ -3698,7 +4570,7 @@ func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
 		return
 	}
 	if !body.IsComplete() {
-		writeJSONError(w, http.StatusBadRequest, "incomplete configuration: need valid network (mainnet/testnet), ports, list_limit, retention_days, p2p_parallel 1–8")
+		writeJSONError(w, http.StatusBadRequest, "incomplete configuration: need valid network (mainnet/testnet), ports, list_limit, retention_days, p2p_parallel 1â€“8")
 		return
 	}
 	newDataDir := filepath.Clean(strings.TrimSpace(body.StorageDir))
@@ -3885,6 +4757,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed init store: %v", err)
 	}
+	store.SetNetwork(network)
 
 	go func() {
 		t := time.NewTicker(1 * time.Minute)
@@ -3914,11 +4787,13 @@ func main() {
 		P2PPort:       p2pPort,
 		P2PParallel:   p2pParallel,
 		P2PLog:        p2pLog,
+		ConfirmMode:   ConfirmModeMsgBlock,
 	}
 	effectiveCfg.ApplyDefaults()
 	if configFileRead {
+		effectiveCfg.ConfirmMode = normalizeConfirmMode(fileCfg.ConfirmMode)
 		effectiveCfg.APIAllowedIPs = normalizeAPIAllowedIPs(fileCfg.APIAllowedIPs)
-		fileCfg.ApplyDefaults() // migrates legacy api_token → user_token
+		fileCfg.ApplyDefaults() // migrates legacy api_token â†’ user_token
 		effectiveCfg.UserToken = fileCfg.UserToken
 		effectiveCfg.AdminToken = fileCfg.AdminToken
 		if err := validateAPIToken(effectiveCfg.UserToken); err != nil {
@@ -3968,6 +4843,7 @@ func main() {
 		htrack:       htrack,
 		processed:    processed,
 		peers:        NewPeerHub(),
+		bloomPeers:   newBloomPeerCache(),
 		settingsPath: settingsPath,
 		httpPort:     publicPort,
 		httpBind:     bindIP,
@@ -4019,6 +4895,9 @@ func main() {
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
 		apiDeleteTransaction(w, r, app.store, app.processed)
 	})
+	mux.HandleFunc("/api/transactions/confirm", func(w http.ResponseWriter, r *http.Request) {
+		apiConfirmTransaction(w, r, app.store, app.htrack)
+	})
 	mux.HandleFunc("/api/broadcast", func(w http.ResponseWriter, r *http.Request) {
 		apiPostBroadcast(w, r, app)
 	})
@@ -4062,6 +4941,8 @@ func main() {
 		for _, tx := range recents {
 			row := map[string]any{
 				"txid":          tx.Txid,
+				"vout":          tx.Vout,
+				"utxo":          tx.Utxo,
 				"datetime":      tx.Datetime,
 				"amount_doge":   tx.AmountDoge,
 				"double_spent":  tx.DoubleSpent,
@@ -4069,6 +4950,12 @@ func main() {
 			}
 			if tx.BlockHeight != 0 {
 				row["block_height"] = tx.BlockHeight
+			}
+			if tx.FromAddress != "" {
+				row["from_address"] = tx.FromAddress
+			}
+			if len(tx.FromAddresses) > 0 {
+				row["from_addresses"] = tx.FromAddresses
 			}
 			txs = append(txs, row)
 		}

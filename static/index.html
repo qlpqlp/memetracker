@@ -420,6 +420,13 @@
             <div><label>P2P port</label><input name="p2p_port" type="number" min="1" max="65535" required/></div>
             <div><label>P2P parallel workers (1–8)</label><input name="p2p_parallel" type="number" min="1" max="8" required/></div>
             <div><label>P2P log level (0–2)</label><input name="p2p_log" type="number" min="0" max="2" required/></div>
+            <div style="grid-column:1/-1"><label>Confirm mode</label>
+              <select name="confirm_mode">
+                <option value="msg_block">MSG_BLOCK — full block bodies, any peer (default; full mempool graph)</option>
+                <option value="node_bloom">NODE_BLOOM — bloom peers for SPV confirms (filter only during getdata; full mempool graph)</option>
+              </select>
+              <p class="muted" style="margin:.35rem 0 0;font-size:.85rem">Bloom mode only keeps peers with <span class="mono">NODE_BLOOM</span>. Filter is temporary around merkleblock requests so the mempool chart stays full. Change requires Stop then Start. Use <strong>Mark confirmed</strong> for old stuck rows.</p>
+            </div>
           </div>
           <div style="grid-column:1/-1">
             <label>Allowed IPs (optional, shared)</label>
@@ -572,10 +579,10 @@
       <section id="panel-tx" class="panel">
         <div class="card">
           <h2>Transactions</h2>
-          <p class="muted">Matched payments to your watched addresses only (not the full mempool list on the Dashboard). Status shows unconfirmed or confirmed with depth 0-5. Use the copy badge after each txid, or open on sochain.</p>
+          <p class="muted">Matched payments to your watched addresses only (not the full mempool list on the Dashboard). Each row is one UTXO (<span class="mono">txid:vout</span>). <span class="mono">From</span> is the payer P2PKH when the input pubkey is present. Status shows unconfirmed or confirmed with depth 0-5. Use the copy badge after each txid/UTXO, or open on sochain.</p>
           <div class="table-wrap">
             <table class="responsive" id="table-tx">
-              <thead><tr><th>Time (UTC)</th><th>Address</th><th>Txid</th><th>DOGE</th><th>Status</th><th>Explorer / remove</th></tr></thead>
+              <thead><tr><th>Time (UTC)</th><th>Address</th><th>From</th><th>Txid</th><th>UTXO</th><th>DOGE</th><th>Status</th><th>Explorer / remove</th></tr></thead>
               <tbody id="tbody-tx"></tbody>
             </table>
           </div>
@@ -638,7 +645,7 @@
       <section id="panel-help" class="panel">
         <div class="card help-block">
           <h2>How MemeTracker works</h2>
-          <p>MemeTracker connects to the Dogecoin P2P network and watches the <strong>mempool first</strong> (inventory and raw transactions). Headers and tip-block scans are only a <strong>backup</strong> if a payment skips mempool relay and is mined immediately. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, time, and DOGE amount and stores it under your data directory.</p>
+          <p>MemeTracker connects to the Dogecoin P2P network and watches the <strong>mempool first</strong> (inventory and raw transactions). Confirmations use <strong>headers + BIP-37 merkleblocks</strong> (SPV-style) when peers support bloom filters, so full block bodies are not required for every tip advance. When a transaction pays one of your tracked P2PKH-style outputs, the app records txid, UTXO (<span class="mono">txid:vout</span>), time, and DOGE amount and stores it under your data directory.</p>
           <h3>Dashboard</h3>
           <p>Summary counters plus <strong>live trend charts</strong> (mempool visibility, connected workers, stored rows and tracked addresses) built from browser polling while you keep the dashboard open. Header safeguard stats show tip hash/time, headers kept, blocks scanned, and payments first seen from blocks.</p>
           <h3>Start / Stop</h3>
@@ -664,7 +671,7 @@
 curl -s BASE/{user_token}/healthz
 curl -s BASE/{admin_token}/api/status</code></pre>
           <h3>Start / Stop P2P</h3>
-          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"user_token\":\"\",\"admin_token\":\"\"}"
+          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"confirm_mode\":\"msg_block\",\"user_token\":\"\",\"admin_token\":\"\"}"
 
 curl -s -X POST BASE/api/stop</code></pre>
           <h3>Runtime limits</h3>
@@ -681,12 +688,14 @@ curl -s -X POST BASE/{admin_token}/api/broadcast -H "Content-Type: application/j
           <p class="muted">Response includes <span class="mono">txid</span>, <span class="mono">transmitted</span>, and per-peer <span class="mono">results</span> with write confirmation. Requires P2P running and at least one connected peer. User path is <span class="mono">/broadcast</span>; admin may also use <span class="mono">/api/broadcast</span>.</p>
           <p class="muted">User token: <span class="mono">/track</span> + <span class="mono">/healthz</span> + <span class="mono">/broadcast</span>. Admin token: web UI + <span class="mono">/api</span>. Shared IP whitelist = full access.</p>
           <h3>Double-spend flag in API data</h3>
-          <p>In <span class="mono">/api/status</span>, each item in <span class="mono">transactions</span> includes <span class="mono">double_spent</span>, <span class="mono">confirmed</span>, and <span class="mono">confirmations</span> (0-5, from headers/blocks after inclusion).</p>
+          <p>In <span class="mono">/api/status</span> and <span class="mono">/track/{address}</span>, each transaction includes <span class="mono">vout</span>, <span class="mono">utxo</span> (<span class="mono">txid:vout</span>), <span class="mono">from_address</span> (payer P2PKH derived from input pubkey when present), optional <span class="mono">from_addresses</span>, <span class="mono">double_spent</span>, <span class="mono">confirmed</span>, and <span class="mono">confirmations</span> (0-5, from headers after inclusion via SPV merkleblocks when peers support BIP-37).</p>
           <h3>Header safeguard in API data</h3>
           <p>Object <span class="mono">header_safeguard</span> includes tip hash, tip height (when known), tip time, headers kept, blocks scanned, the block currently being scanned (<span class="mono">scanning_block_hash</span> / height), pending block getdata hashes, <span class="mono">confirmed_hits</span>, and whether the tip was resumed from disk.</p>
-          <h3>Remove address / tx row</h3>
+          <h3>Remove address / tx row / mark confirmed</h3>
           <pre><code>curl -s -X DELETE "BASE/api/addresses/{hash160_hex}"
-curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></pre>
+curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."
+curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/json" -d "{\"txid\":\"...\",\"hash160_hex\":\"...\"}"</code></pre>
+          <p class="muted">Mark confirmed is for old payments already deep in the chain that MemeTracker never saw mined (outside the sequential catch-up window). It only updates local storage.</p>
           <p class="muted">All API responses are JSON unless noted. Errors include an <span class="mono">error</span> string. A complete <span class="mono">memetracker_config.json</span> shape is required for <span class="mono">/api/start</span>; you may include <span class="mono">api_allowed_ips</span>, <span class="mono">user_token</span>, and <span class="mono">admin_token</span>.</p>
         </div>
       </section>
@@ -1202,6 +1211,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
     f.p2p_port.value = fc.p2p_port;
     f.p2p_parallel.value = fc.p2p_parallel;
     f.p2p_log.value = fc.p2p_log;
+    if (f.confirm_mode) f.confirm_mode.value = fc.confirm_mode || "msg_block";
     var ips = fc.api_allowed_ips;
     f.api_allowed_ips_text.value = Array.isArray(ips) && ips.length ? ips.join("\n") : "";
     if (f.user_token) f.user_token.value = fc.user_token || fc.api_token || "";
@@ -1267,16 +1277,24 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
             scanCopy.classList.add("hidden");
             scanCopy.setAttribute("data-copy-tx", "");
           }
-          scanMeta.textContent = pendingN + " block getdata pending" +
-            (pendingHashes.length > 1 ? (" (showing 1 of " + pendingHashes.length + ")") : "");
+          var unconfHint = (Number(st.stored_transaction_rows) > 0)
+            ? "Confirm catch-up for unconfirmed stored payment(s). "
+            : "";
+          scanMeta.textContent = unconfHint + pendingN + " block getdata pending" +
+            (pendingHashes.length > 1 ? (" (showing 1 of " + pendingHashes.length + ")") : "") +
+            " — Mark confirmed if the tx is already old/deep in the chain.";
         } else if (lastHash) {
-          scanHeightEl.textContent = (hs.last_scanned_block_height != null && hs.last_scanned_block_height !== "")
-            ? ("last scanned height " + hs.last_scanned_block_height)
-            : "last scanned";
+          var tipH = (hs.tip_height != null && hs.tip_height !== "") ? Number(hs.tip_height) : NaN;
+          var lastH = (hs.last_scanned_block_height != null && hs.last_scanned_block_height !== "") ? Number(hs.last_scanned_block_height) : NaN;
+          var behind = (!isNaN(tipH) && !isNaN(lastH) && tipH > lastH) ? (tipH - lastH) : 0;
+          scanHeightEl.textContent = (!isNaN(lastH) ? ("last scanned height " + lastH) : "last scanned") +
+            (behind > 0 ? (" · tip " + tipH + " (" + behind + " behind)") : "");
           scanHashEl.textContent = lastHash;
           scanCopy.classList.remove("hidden");
           scanCopy.setAttribute("data-copy-tx", lastHash);
-          var lastParts = ["Idle between scans"];
+          var lastParts = behind > 0
+            ? ["Catch-up toward tip (sequential; gaps snap forward)"]
+            : ["Idle — cursor at tip"];
           if (hs.last_scanned_utc) lastParts.push("finished " + hs.last_scanned_utc);
           if (hs.blocks_scanned != null) lastParts.push("total bodies " + hs.blocks_scanned);
           scanMeta.textContent = lastParts.join(" · ");
@@ -1312,6 +1330,8 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       }
       var statRows = [
         { k: "P2P running", v: run ? "yes" : "no", hint: run ? "Workers rotate peers between sessions." : "Start from the banner or use a complete memetracker_config.json." },
+        { k: "Confirm mode", v: st.confirm_mode || (st.full_config && st.full_config.confirm_mode) || "msg_block", hint: "msg_block = full bodies; node_bloom = SPV filtered peers only." },
+        { k: "Bloom peers known", v: st.bloom_peers_known != null ? st.bloom_peers_known : 0, hint: "Peers that advertised NODE_BLOOM (preferred when confirm_mode=node_bloom)." },
         { k: "Tracked addresses", v: st.watched_addresses },
         { k: "Stored tx rows", v: st.stored_transaction_rows },
         { k: "Mempool (unique tx ids)", v: st.mempool_tx_count, hint: run ? "Relay visibility on current peer sessions." : "Starts counting when P2P is running." },
@@ -1370,15 +1390,24 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
         var statusBadge = '<span class="' + confCls + '" title="' + (tx.confirmed ? ("Confirmed " + confN + " of 5") : "Unconfirmed (mempool)") + '">' +
           '<span class="conf-pie">' + confirmationPieSvg(confN) + '</span>' +
           '<span class="conf-pie-label">' + confLabel + '</span></span>';
+        var utxo = tx.utxo || ((tx.txid || "") + ":" + (tx.vout != null ? tx.vout : 0));
+        var utxoEsc = escapeHtml(utxo);
         var dsBadge = tx.double_spent ? ' <span class="pill warn">Double spent detected</span>' : "";
+        var fromAddr = tx.from_address || "";
+        var fromEsc = fromAddr ? escapeHtml(fromAddr) : "—";
         tr.innerHTML = '<td data-label="Time">' + escapeHtml(tx.datetime) + '</td>' +
           '<td data-label="Address" class="mono">' + escapeHtml(tx.address) + '</td>' +
+          '<td data-label="From" class="mono">' + fromEsc + '</td>' +
           '<td data-label="Txid" class="mono txid-cell"><span class="txid-line">' + txidEsc +
           '<button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(tx.txid) + '" title="Copy txid" aria-label="Copy txid"><span class="material-icons" aria-hidden="true">content_copy</span></button></span></td>' +
+          '<td data-label="UTXO" class="mono txid-cell"><span class="txid-line">' + utxoEsc +
+          '<button type="button" class="copy-tx-badge" data-copy-tx="' + escapeHtml(utxo) + '" title="Copy UTXO" aria-label="Copy UTXO"><span class="material-icons" aria-hidden="true">content_copy</span></button></span></td>' +
           '<td data-label="DOGE">' + escapeHtml(Number(tx.amount_doge).toFixed(8)) + dsBadge + '</td>' +
           '<td data-label="Status">' + statusBadge + '</td>' +
           '<td data-label="Explorer / remove" class="row-actions"><div class="tx-links">' +
           '<a class="btn btn-sm btn-with-icon" href="' + explore + '" target="_blank" rel="noopener noreferrer"><span class="material-icons" aria-hidden="true">open_in_new</span><span>sochain</span></a>' +
+          (tx.confirmed ? "" :
+          '<button type="button" class="btn btn-sm btn-with-icon" data-confirm-tx="' + encodeURIComponent(tx.hash160_hex) + '" data-txid="' + escapeHtml(tx.txid) + '" title="Mark as confirmed (old block outside catch-up)"><span class="material-icons" aria-hidden="true">verified</span><span>Mark confirmed</span></button>') +
           '<button type="button" class="btn btn-danger btn-sm btn-with-icon" data-rm-tx="' + encodeURIComponent(tx.hash160_hex) + '" data-txid="' + escapeHtml(tx.txid) + '"><span class="material-icons" aria-hidden="true">delete_outline</span><span>Remove</span></button>' +
           '</div></td>';
         tbx.appendChild(tr);
@@ -1460,6 +1489,28 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       } catch (e) { showFlash(e.message, false); }
       return;
     }
+    var confBtn = ev.target.closest("[data-confirm-tx]");
+    if (confBtn) {
+      var confHash = decodeURIComponent(confBtn.getAttribute("data-confirm-tx"));
+      var confTxid = confBtn.getAttribute("data-txid");
+      var okConf = await confirmModal({
+        title: "Mark transaction confirmed",
+        body: "Mark this payment as confirmed (5/5)? Use this for older txs already in the chain outside the catch-up window. This only updates MemeTracker storage.",
+        confirmText: "Mark confirmed",
+        danger: false
+      });
+      if (!okConf) return;
+      try {
+        await api("/api/transactions/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ hash160_hex: confHash, txid: confTxid })
+        });
+        showFlash("Marked confirmed.", true);
+        refreshAll();
+      } catch (e) { showFlash(e.message, false); }
+      return;
+    }
     var t = ev.target.closest("[data-rm-tx]");
     if (t) {
       var hash = decodeURIComponent(t.getAttribute("data-rm-tx"));
@@ -1493,6 +1544,7 @@ curl -s -X DELETE "BASE/api/transactions?txid=...&amp;hash160_hex=..."</code></p
       p2p_port: parseInt(f.p2p_port.value, 10),
       p2p_parallel: parseInt(f.p2p_parallel.value, 10),
       p2p_log: parseInt(f.p2p_log.value, 10),
+      confirm_mode: (f.confirm_mode && f.confirm_mode.value) || "msg_block",
       api_allowed_ips: parseIPList(f.api_allowed_ips_text.value || ""),
       user_token: ((f.user_token && f.user_token.value) || "").trim(),
       admin_token: ((f.admin_token && f.admin_token.value) || "").trim()
