@@ -136,12 +136,14 @@ func (c *bloomPeerCache) Count() int {
 }
 
 const (
-	MAGIC               = 0xC0C0C0C0
-	COMMAND_LEN         = 12
-	MSG_WITNESS_FLAG    = 1 << 30
-	MSG_TX              = 1 // inventory type for transactions (and MSG_TX|MSG_WITNESS_FLAG for segwit)
-	NODE_NETWORK        = 1 << 0
-	NODE_WITNESS        = 1 << 3
+	magicMainnet       = uint32(0xC0C0C0C0) // pchMessageStart c0 c0 c0 c0
+	magicLegacyTestnet = uint32(0xDCB7C1FC) // legacy testnet3: fc c1 b7 dc
+	magicRebootTestnet = uint32(0xE1DCD4FD) // DogeGo/Core reboot testnet: fd d4 dc e1
+	COMMAND_LEN        = 12
+	MSG_WITNESS_FLAG   = 1 << 30
+	MSG_TX             = 1 // inventory type for transactions (and MSG_TX|MSG_WITNESS_FLAG for segwit)
+	NODE_NETWORK       = 1 << 0
+	NODE_WITNESS       = 1 << 3
 	// NODE_BLOOM is defined in bloom.go (BIP-111); used for SPV filtered-block confirms.
 	GETDATA_BATCH          = 100
 	MAX_TX_FETCH_INV       = 500 // per inv; mark requested so large mempool dumps progress past this window
@@ -156,11 +158,69 @@ const (
 	MEMPOOL_PAGE_MAX       = 100
 )
 
+// activeP2PMagic is the wire magic for the configured network (set when P2P starts).
+var activeP2PMagic atomic.Uint32
+
+func currentMagic() uint32 {
+	m := activeP2PMagic.Load()
+	if m == 0 {
+		return magicMainnet
+	}
+	return m
+}
+
+func setActiveP2PMagic(network string) {
+	activeP2PMagic.Store(networkMagic(network))
+}
+
+func normalizeNetwork(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "main", "mainnet":
+		return "mainnet"
+	case "testnet", "test", "testnet3", "legacytestnet":
+		return "testnet"
+	case "reboot", "reboottestnet", "reboot-testnet", "reboot_testnet":
+		return "reboottestnet"
+	default:
+		return strings.ToLower(strings.TrimSpace(s))
+	}
+}
+
+func isValidNetwork(s string) bool {
+	switch normalizeNetwork(s) {
+	case "mainnet", "testnet", "reboottestnet":
+		return true
+	default:
+		return false
+	}
+}
+
+func networkMagic(network string) uint32 {
+	switch normalizeNetwork(network) {
+	case "reboottestnet":
+		return magicRebootTestnet
+	case "testnet":
+		return magicLegacyTestnet
+	default:
+		return magicMainnet
+	}
+}
+
+func networkDefaultPort(network string) int {
+	switch normalizeNetwork(network) {
+	case "reboottestnet", "testnet":
+		return 44556
+	default:
+		return 22556
+	}
+}
+
 //go:embed static/*
 var staticFiles embed.FS
 
 var mainnetP2PKHVersion = byte(0x1E)
-var testnetP2PKHVersion = byte(0x71)
+var testnetP2PKHVersion = byte(0x71)      // legacy Dogecoin testnet3
+var rebootTestnetP2PKHVersion = byte(0x41) // DogeGo/Core reboot testnet ("n"/"m"-style T-prefix in Core docs = 0x41)
 
 // Same seed hostnames as memetracker/mainnet Dogecoin DNS.
 var mainnetDNSSeeds = []string{
@@ -169,6 +229,11 @@ var mainnetDNSSeeds = []string{
 	"seed.multidoge.org",
 	"seed2.multidoge.org",
 	// seed.dogecoin.com omitted: often NXDOMAIN; remaining seeds match chainparams.
+}
+
+// Reboot testnet discovery (DogeGo): seed.dogego.org first, then Core fixed seeds via DNS when available.
+var rebootTestnetDNSSeeds = []string{
+	"seed.dogego.org",
 }
 
 // ------- Utilities -------
@@ -309,10 +374,14 @@ func hash160(data []byte) []byte {
 }
 
 func p2pkhVersionForNetwork(network string) byte {
-	if strings.EqualFold(strings.TrimSpace(network), "testnet") {
+	switch normalizeNetwork(network) {
+	case "reboottestnet":
+		return rebootTestnetP2PKHVersion
+	case "testnet":
 		return testnetP2PKHVersion
+	default:
+		return mainnetP2PKHVersion
 	}
-	return mainnetP2PKHVersion
 }
 
 func encodeP2PKHAddress(h160 []byte, network string) string {
@@ -323,10 +392,7 @@ func encodeP2PKHAddress(h160 []byte, network string) string {
 }
 
 func decodePayoutToHash160(address string, network string) ([]byte, error) {
-	wantVer := mainnetP2PKHVersion
-	if strings.ToLower(network) != "mainnet" {
-		wantVer = testnetP2PKHVersion
-	}
+	wantVer := p2pkhVersionForNetwork(network)
 	p, err := b58checkDecode(address)
 	if err != nil {
 		return nil, err
@@ -1044,7 +1110,7 @@ func buildMessage(command string, payload []byte) []byte {
 	hdr := make([]byte, 0, 24)
 
 	tmp := make([]byte, 4)
-	binary.LittleEndian.PutUint32(tmp, uint32(MAGIC))
+	binary.LittleEndian.PutUint32(tmp, currentMagic())
 	hdr = append(hdr, tmp...)
 
 	hdr = append(hdr, padded...)
@@ -1077,7 +1143,7 @@ func readExact(conn net.Conn, size int) ([]byte, error) {
 // Dogecoin mainnet P2P message magic is 0xc0c0c0c0 as a uint32; on the wire it is 4 bytes little-endian.
 func dogeMagicWireHexLE() string {
 	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], uint32(MAGIC))
+	binary.LittleEndian.PutUint32(b[:], currentMagic())
 	return hex.EncodeToString(b[:])
 }
 
@@ -2622,11 +2688,16 @@ func (ps *ProcessedSet) Remove(k string) {
 }
 
 func chooseSeeds(network string) ([]string, int) {
-	if strings.ToLower(network) == "mainnet" {
-		return mainnetDNSSeeds, 22556
+	switch normalizeNetwork(network) {
+	case "mainnet":
+		return mainnetDNSSeeds, networkDefaultPort(network)
+	case "reboottestnet":
+		// https://github.com/qlpqlp/dogego — reboot testnet DNS seed first.
+		return rebootTestnetDNSSeeds, networkDefaultPort(network)
+	default:
+		// Legacy Dogecoin testnet3.
+		return []string{"seed.testnet.dogecoin.org"}, networkDefaultPort(network)
 	}
-	// Simplified testnet support.
-	return []string{"seed.testnet.dogecoin.org"}, 44556
 }
 
 func shufflePeerIPs(workerID int, ips []string) []string {
@@ -2724,7 +2795,8 @@ func mempoolSniffer(store *Store, network string, p2pHost string, p2pPort int, p
 	if bloomPeers == nil {
 		bloomPeers = newBloomPeerCache()
 	}
-	log.Printf("[MTR-P2P] confirm_mode=%s (msg_block=full bodies; node_bloom=BIP-37 SPV, require NODE_BLOOM peers)", confirmMode)
+	setActiveP2PMagic(network)
+	log.Printf("[MTR-P2P] confirm_mode=%s network=%s magic=0x%x (msg_block=full bodies; node_bloom=BIP-37 SPV, require NODE_BLOOM peers)", confirmMode, normalizeNetwork(network), currentMagic())
 	for w := 0; w < parallel; w++ {
 		go mempoolP2PWorker(w, parallel, store, network, p2pHost, p2pPort, p2pLog, mcol, htrack, processed, peers, blocks, confirmMode, bloomPeers, stop)
 	}
@@ -3324,7 +3396,7 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 		}
 	}
 
-	logf("connected peer=%s handshake start (Dogecoin P2P magic_u32le=0x%x wire_magic_4b_le_hex=%s)", stateLastPeer, MAGIC, dogeMagicWireHexLE())
+	logf("connected peer=%s handshake start (Dogecoin P2P magic_u32le=0x%x wire_magic_4b_le_hex=%s)", stateLastPeer, currentMagic(), dogeMagicWireHexLE())
 	verOut := buildVersionPayload(p2pPort)
 	verMsg := buildMessage("version", verOut)
 	logf("sending VERSION cmd payload_len=%d total_msg_bytes=%d - %s", len(verOut), len(verMsg), summarizeOutgoingVersionPayload(verOut, p2pPort))
@@ -3365,12 +3437,15 @@ func memetrackerP2PSession(conn net.Conn, stateLastPeer string, store *Store, pr
 		if err := queueScan(); err != nil {
 			return err
 		}
-		if mempoolBusy() {
+		if mempoolBusy() && !htrack.NeedsHeaderSync() {
 			return nil
 		}
 		topup := time.Duration(GETHEADERS_TOPUP_SEC) * time.Second
-		if store.watcherCount() == 0 {
+		if store.watcherCount() == 0 || htrack.NeedsHeaderSync() {
 			topup = time.Duration(GETHEADERS_TOPUP_IDLE_SEC) * time.Second
+		}
+		if htrack.NeedsHeaderSync() {
+			topup = 5 * time.Second // cold-start: keep pulling header batches toward tip
 		}
 		if time.Since(lastGetHeaders) >= topup {
 			if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
@@ -3429,9 +3504,9 @@ readLoop:
 		logv("recv header24: magic_u32le=0x%x cmd12=%q payload_len_u32le=%d checksum4=%x cmd_raw_bytes=%q",
 			magic, cmd, size, chkWire, hex.EncodeToString(cmdRaw))
 
-		if magic != uint32(MAGIC) {
+		if magic != currentMagic() {
 			logf("wrong magic peer=%s got_u32le=0x%x want_u32le=0x%x (LE bytes got_hex=%s want_hex=%s) - skipping 24b, stream may be misaligned (TLS/wrong chain?)",
-				stateLastPeer, magic, MAGIC, hex.EncodeToString(header[0:4]), dogeMagicWireHexLE())
+				stateLastPeer, magic, currentMagic(), hex.EncodeToString(header[0:4]), dogeMagicWireHexLE())
 			logv("full_header24_hex=%s", hex.EncodeToString(header))
 			continue
 		}
@@ -3570,7 +3645,8 @@ readLoop:
 			}
 			if len(hdrs) > 0 {
 				lastGetHeaders = time.Now()
-				if len(hdrs) >= 2000 && !mempoolBusy() {
+				// Keep chaining getheaders while the peer returns full batches, or until tip height is known.
+				if (len(hdrs) >= 2000 || htrack.NeedsHeaderSync()) && (!mempoolBusy() || htrack.NeedsHeaderSync()) {
 					if err := sendGetHeaders(conn, htrack, logf, logv); err != nil {
 						sessionExit = err
 						break readLoop
@@ -3857,10 +3933,16 @@ type MemeTrackerConfig struct {
 	P2PLog         int      `json:"p2p_log"`
 	// ConfirmMode: "msg_block" (default) = full block bodies from any peer;
 	// "node_bloom" = BIP-37 SPV like dogecoin-wallet (only peers advertising NODE_BLOOM).
-	ConfirmMode   string   `json:"confirm_mode,omitempty"`
-	APIAllowedIPs  []string `json:"api_allowed_ips,omitempty"` // shared IP allowlist (full access when matched)
-	UserToken      string   `json:"user_token,omitempty"`       // user: /{token}/track/... , /{token}/healthz, /{token}/broadcast
-	AdminToken     string   `json:"admin_token,omitempty"`      // admin: web UI + /api/* + everything
+	ConfirmMode string `json:"confirm_mode,omitempty"`
+	// StartCheckpointHash is an optional block hash hex used as the cold-start
+	// getheaders locator instead of the network genesis (faster tip sync).
+	StartCheckpointHash string `json:"start_checkpoint_hash,omitempty"`
+	// StartCheckpointHeight is the height of StartCheckpointHash when known.
+	// Ignored when start_checkpoint_hash is empty. Use -1 if hash is set but height is unknown.
+	StartCheckpointHeight int64 `json:"start_checkpoint_height"`
+	APIAllowedIPs         []string `json:"api_allowed_ips,omitempty"` // shared IP allowlist (full access when matched)
+	UserToken             string   `json:"user_token,omitempty"`       // user: /{token}/track/... , /{token}/healthz, /{token}/broadcast
+	AdminToken            string   `json:"admin_token,omitempty"`      // admin: web UI + /api/* + everything
 	// APIToken is a legacy alias for UserToken (read from older memetracker_config.json).
 	APIToken string `json:"api_token,omitempty"`
 }
@@ -3873,7 +3955,7 @@ func (c *MemeTrackerConfig) ApplyDefaults() {
 	if c.HTTPBind == "" {
 		c.HTTPBind = "0.0.0.0"
 	}
-	c.Network = strings.TrimSpace(c.Network)
+	c.Network = normalizeNetwork(c.Network)
 	if c.Network == "" {
 		c.Network = "mainnet"
 	}
@@ -3884,8 +3966,10 @@ func (c *MemeTrackerConfig) ApplyDefaults() {
 		c.RetentionDays = 7
 	}
 	if c.P2PPort == 0 {
-		c.P2PPort = 22556
+		c.P2PPort = networkDefaultPort(c.Network)
 	}
+	c.StartCheckpointHash = strings.ToLower(strings.TrimSpace(c.StartCheckpointHash))
+	c.StartCheckpointHash = strings.TrimPrefix(c.StartCheckpointHash, "0x")
 	if c.P2PParallel == 0 {
 		c.P2PParallel = 3
 	}
@@ -3914,9 +3998,18 @@ func (c *MemeTrackerConfig) IsComplete() bool {
 	if strings.TrimSpace(c.HTTPBind) == "" {
 		return false
 	}
-	n := strings.ToLower(strings.TrimSpace(c.Network))
-	if n != "mainnet" && n != "testnet" {
+	n := normalizeNetwork(c.Network)
+	if !isValidNetwork(n) {
 		return false
+	}
+	c.Network = n
+	if c.StartCheckpointHash != "" {
+		if len(c.StartCheckpointHash) != 64 {
+			return false
+		}
+		if _, err := hex.DecodeString(c.StartCheckpointHash); err != nil {
+			return false
+		}
 	}
 	if c.ListLimit < 1 || c.RetentionDays < 1 {
 		return false
@@ -4207,6 +4300,10 @@ func (a *appState) startP2P() {
 	cfg := a.snapshotCfg()
 	network := strings.ToLower(strings.TrimSpace(cfg.Network))
 	a.store.SetNetwork(network)
+	if a.htrack != nil {
+		a.htrack.SetNetwork(network)
+		a.htrack.SetStartCheckpoint(cfg.StartCheckpointHash, cfg.StartCheckpointHeight)
+	}
 	host := strings.TrimSpace(cfg.P2PHost)
 	if a.bloomPeers == nil {
 		a.bloomPeers = newBloomPeerCache()
@@ -4570,7 +4667,7 @@ func apiPostStart(w http.ResponseWriter, r *http.Request, app *appState) {
 		return
 	}
 	if !body.IsComplete() {
-		writeJSONError(w, http.StatusBadRequest, "incomplete configuration: need valid network (mainnet/testnet), ports, list_limit, retention_days, p2p_parallel 1â€“8")
+		writeJSONError(w, http.StatusBadRequest, "incomplete configuration: need valid network (mainnet/testnet/reboottestnet), ports, list_limit, retention_days, p2p_parallel 1–8")
 		return
 	}
 	newDataDir := filepath.Clean(strings.TrimSpace(body.StorageDir))
@@ -4771,6 +4868,7 @@ func main() {
 
 	mcol := NewMetricsCollector(50000)
 	htrack := NewHeaderTracker(storageDir)
+	htrack.SetNetwork(network)
 	if tip := htrack.TipHash(); tip != "" {
 		log.Printf("[MTR] header tip resumed from disk hash=%s path=%s", tip, filepath.Join(storageDir, headerTipFileName))
 	}
@@ -4792,8 +4890,12 @@ func main() {
 	effectiveCfg.ApplyDefaults()
 	if configFileRead {
 		effectiveCfg.ConfirmMode = normalizeConfirmMode(fileCfg.ConfirmMode)
+		effectiveCfg.StartCheckpointHash = fileCfg.StartCheckpointHash
+		effectiveCfg.StartCheckpointHeight = fileCfg.StartCheckpointHeight
 		effectiveCfg.APIAllowedIPs = normalizeAPIAllowedIPs(fileCfg.APIAllowedIPs)
-		fileCfg.ApplyDefaults() // migrates legacy api_token â†’ user_token
+		fileCfg.ApplyDefaults() // migrates legacy api_token → user_token
+		effectiveCfg.StartCheckpointHash = fileCfg.StartCheckpointHash
+		effectiveCfg.StartCheckpointHeight = fileCfg.StartCheckpointHeight
 		effectiveCfg.UserToken = fileCfg.UserToken
 		effectiveCfg.AdminToken = fileCfg.AdminToken
 		if err := validateAPIToken(effectiveCfg.UserToken); err != nil {
@@ -4810,6 +4912,7 @@ func main() {
 			effectiveCfg.AdminToken = ""
 		}
 	}
+	htrack.SetStartCheckpoint(effectiveCfg.StartCheckpointHash, effectiveCfg.StartCheckpointHeight)
 	if envTok := normalizeAPIToken(firstNonEmpty(os.Getenv("MTR_USER_TOKEN"), os.Getenv("MTR_API_TOKEN"))); envTok != "" {
 		if err := validateAPIToken(envTok); err != nil {
 			log.Fatalf("invalid user token env: %v", err)

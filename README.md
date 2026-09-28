@@ -17,6 +17,8 @@ MemeTracker is a **Dogecoin mempool watcher**: it connects to the public P2P net
 5. **Storage** - Each watched address has a JSON file under `{storage}/addresses/{hash160}.json`. Transactions are capped per address (`list_limit`) and addresses expire after `retention_days` without a refresh via `GET/POST /track/<address>`.
 6. **HTTP** - A local server (default port **33555**) serves the dashboard, JSON APIs, and `/track/` for automation. Old stuck rows can be marked confirmed via the UI / `POST /api/transactions/confirm`.
 
+**Networks:** `mainnet`, legacy `testnet` (testnet3), and `reboottestnet` ([DogeGo](https://github.com/qlpqlp/dogego) / Core reboot — magic `fd d4 dc e1`, port `44556`, genesis `d5d619f8…`, DNS `seed.dogego.org`). Optional config `start_checkpoint_hash` / `start_checkpoint_height` sets the cold-start header locator instead of the network genesis.
+
 Observed **mempool tx count** in the UI is the number of **unique txids** recently seen on the wire (from `inv` and `tx`), which approximates relay visibility, not necessarily the same as `getrawmempool` on a full node. Dashboard **header safeguard** fields show tip hash/time, headers kept, blocks scanned, and payments first seen via blocks.
 
 ## Quick start
@@ -85,11 +87,11 @@ Use `"storage_dir": ""` or omit to keep the default data directory. If you chang
 | `MTR_HTTP_PORT` / `PUBLIC_PORT` | `33555` | HTTP listen port |
 | `MTR_HTTP_BIND` / `DBX_PUP_IP` | `0.0.0.0` | HTTP bind address |
 | `MTR_STORAGE_DIR` | OS-specific user config path (see below) | Data directory |
-| `MTR_NETWORK` / `NETWORK` | `mainnet` | `mainnet` or `testnet` |
+| `MTR_NETWORK` / `NETWORK` | `mainnet` | `mainnet`, `testnet` (legacy testnet3), or `reboottestnet` ([DogeGo](https://github.com/qlpqlp/dogego) / Core reboot) |
 | `MTR_LIST_LIMIT` / `LIST_LIMIT` | `10` | Max stored txs per address |
 | `MTR_RETENTION_DAYS` / `RETENTION_DAYS` | `7` | Drop address if not refreshed for N days |
 | `MTR_P2P_HOST` / `P2P_HOST` | _(empty)_ | Force a single peer host (else DNS seeds) |
-| `MTR_P2P_PORT` / `P2P_PORT` | `22556` | P2P port |
+| `MTR_P2P_PORT` / `P2P_PORT` | `22556` (mainnet) / `44556` (testnets) | P2P port |
 | `MTR_P2P_PARALLEL` / `P2P_PARALLEL` | `3` | Parallel P2P workers (1-8) |
 | `MTR_P2P_LOG` / `P2P_LOG` | `1` | P2P log verbosity `0`-`2` |
 | `MTR_CONFIG_PATH` | _(see above)_ | Full path to `memetracker_config.json` |

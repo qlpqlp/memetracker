@@ -408,16 +408,17 @@
             <div><label>HTTP port (next restart)</label><input name="http_port" type="number" min="1" max="65535" required/></div>
             <div><label>HTTP bind (next restart)</label><input name="http_bind" type="text" placeholder="0.0.0.0" required/></div>
             <div><label>Network</label>
-              <select name="network" required>
+              <select name="network" required id="cfg-network">
                 <option value="mainnet">mainnet</option>
-                <option value="testnet">testnet</option>
+                <option value="testnet">testnet (legacy testnet3)</option>
+                <option value="reboottestnet">reboottestnet (DogeGo / Core reboot)</option>
               </select>
             </div>
             <div><label>Data directory</label><input name="storage_dir" type="text" placeholder="path for addresses/"/></div>
             <div><label>Max txs per address</label><input name="list_limit" type="number" min="1" max="10000" required/></div>
             <div><label>Retention (days)</label><input name="retention_days" type="number" min="1" max="3650" required/></div>
             <div><label>P2P host (optional)</label><input name="p2p_host" type="text" placeholder="empty = DNS seeds"/></div>
-            <div><label>P2P port</label><input name="p2p_port" type="number" min="1" max="65535" required/></div>
+            <div><label>P2P port</label><input name="p2p_port" type="number" min="1" max="65535" required id="cfg-p2p-port"/></div>
             <div><label>P2P parallel workers (1–8)</label><input name="p2p_parallel" type="number" min="1" max="8" required/></div>
             <div><label>P2P log level (0–2)</label><input name="p2p_log" type="number" min="0" max="2" required/></div>
             <div style="grid-column:1/-1"><label>Confirm mode</label>
@@ -426,6 +427,14 @@
                 <option value="node_bloom">NODE_BLOOM — bloom peers for SPV confirms (filter only during getdata; full mempool graph)</option>
               </select>
               <p class="muted" style="margin:.35rem 0 0;font-size:.85rem">Bloom mode only keeps peers with <span class="mono">NODE_BLOOM</span>. Filter is temporary around merkleblock requests so the mempool chart stays full. Change requires Stop then Start. Use <strong>Mark confirmed</strong> for old stuck rows.</p>
+            </div>
+            <div style="grid-column:1/-1"><label>Start checkpoint hash (optional)</label>
+              <input name="start_checkpoint_hash" type="text" class="mono" placeholder="64-char block hash hex — cold-start getheaders locator instead of genesis"/>
+              <p class="muted" style="margin:.35rem 0 0;font-size:.85rem">When starting with an empty tip, use this hash instead of the network genesis so header sync does not walk from block 0. Leave empty to use the hardcoded genesis for the selected network.</p>
+            </div>
+            <div><label>Start checkpoint height</label>
+              <input name="start_checkpoint_height" type="number" min="-1" step="1" placeholder="-1 if unknown"/>
+              <p class="muted" style="margin:.35rem 0 0;font-size:.85rem">Height of the checkpoint hash when known; <span class="mono">-1</span> if unknown.</p>
             </div>
           </div>
           <div style="grid-column:1/-1">
@@ -671,7 +680,7 @@
 curl -s BASE/{user_token}/healthz
 curl -s BASE/{admin_token}/api/status</code></pre>
           <h3>Start / Stop P2P</h3>
-          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"confirm_mode\":\"msg_block\",\"user_token\":\"\",\"admin_token\":\"\"}"
+          <pre><code>curl -s -X POST BASE/api/start -H "Content-Type: application/json" -d "{\"http_port\":33555,\"http_bind\":\"0.0.0.0\",\"network\":\"mainnet\",\"storage_dir\":\"\",\"list_limit\":10,\"retention_days\":7,\"p2p_host\":\"\",\"p2p_port\":22556,\"p2p_parallel\":3,\"p2p_log\":1,\"confirm_mode\":\"msg_block\",\"start_checkpoint_hash\":\"\",\"start_checkpoint_height\":0,\"user_token\":\"\",\"admin_token\":\"\"}"
 
 curl -s -X POST BASE/api/stop</code></pre>
           <h3>Runtime limits</h3>
@@ -1212,6 +1221,12 @@ curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/js
     f.p2p_parallel.value = fc.p2p_parallel;
     f.p2p_log.value = fc.p2p_log;
     if (f.confirm_mode) f.confirm_mode.value = fc.confirm_mode || "msg_block";
+    if (f.start_checkpoint_hash) f.start_checkpoint_hash.value = fc.start_checkpoint_hash || "";
+    if (f.start_checkpoint_height) {
+      f.start_checkpoint_height.value = (fc.start_checkpoint_height != null && fc.start_checkpoint_height !== "")
+        ? fc.start_checkpoint_height
+        : (fc.start_checkpoint_hash ? -1 : "");
+    }
     var ips = fc.api_allowed_ips;
     f.api_allowed_ips_text.value = Array.isArray(ips) && ips.length ? ips.join("\n") : "";
     if (f.user_token) f.user_token.value = fc.user_token || fc.api_token || "";
@@ -1533,6 +1548,14 @@ curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/js
   $("#form-start").addEventListener("submit", async function(ev) {
     ev.preventDefault();
     var f = ev.target;
+    var cpHash = ((f.start_checkpoint_hash && f.start_checkpoint_hash.value) || "").trim();
+    var cpHeight = -1;
+    if (f.start_checkpoint_height && f.start_checkpoint_height.value !== "") {
+      var parsedH = parseInt(f.start_checkpoint_height.value, 10);
+      if (!isNaN(parsedH)) cpHeight = parsedH;
+    } else if (!cpHash) {
+      cpHeight = 0;
+    }
     var body = {
       http_port: parseInt(f.http_port.value, 10),
       http_bind: f.http_bind.value.trim(),
@@ -1545,6 +1568,8 @@ curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/js
       p2p_parallel: parseInt(f.p2p_parallel.value, 10),
       p2p_log: parseInt(f.p2p_log.value, 10),
       confirm_mode: (f.confirm_mode && f.confirm_mode.value) || "msg_block",
+      start_checkpoint_hash: cpHash,
+      start_checkpoint_height: cpHeight,
       api_allowed_ips: parseIPList(f.api_allowed_ips_text.value || ""),
       user_token: ((f.user_token && f.user_token.value) || "").trim(),
       admin_token: ((f.admin_token && f.admin_token.value) || "").trim()
@@ -1570,6 +1595,16 @@ curl -s -X POST "BASE/api/transactions/confirm" -H "Content-Type: application/js
   $("#form-start").addEventListener("input", function() {
     formState.startDirty = true;
   });
+  var netSel = $("#cfg-network");
+  if (netSel) {
+    netSel.addEventListener("change", function() {
+      var portEl = $("#cfg-p2p-port");
+      if (!portEl) return;
+      var n = (netSel.value || "").toLowerCase();
+      if (n === "mainnet") portEl.value = 22556;
+      else portEl.value = 44556;
+    });
+  }
   $("#form-cfg").addEventListener("input", function() {
     formState.cfgDirty = true;
   });

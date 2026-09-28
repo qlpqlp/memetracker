@@ -15,22 +15,29 @@ import (
 )
 
 const (
-	MSG_BLOCK                 = 2
-	AUXPOW_VERSION_BIT        = uint32(1 << 8)
-	HEADER_RETENTION          = 24 * time.Hour
+	MSG_BLOCK                  = 2
+	AUXPOW_VERSION_BIT         = uint32(1 << 8)
+	HEADER_RETENTION           = 24 * time.Hour
 	// Block bodies are backup-only (missed mempool -> mined) and confirmation catch-up.
 	// Depth must cover delayed tip scans so mempool-seen payments do not stay at 0 confs.
-	BLOCK_BODY_SCAN_MAX_AGE   = 45 * time.Minute
-	BLOCK_BODY_SCAN_MAX_DEPTH = 24
-	MAX_HEADER_RING           = 2000
-	MAX_BLOCK_FETCH_INV       = 8 // allow Dogecoin multi-block bursts without skipping
-	MAX_PENDING_BLOCKS        = 12
-	PENDING_BLOCK_TIMEOUT     = 45 * time.Second // abandon getdata that never returns (session churn)
-	CONFIRMATION_CATCHUP_DEPTH = 64 // sequential resume window toward tip
-	GETHEADERS_TOPUP_SEC      = 120 // slower while watching payments
-	GETHEADERS_TOPUP_IDLE_SEC = 45  // faster tip tracking when no watchers
-	PROTOCOL_VERSION_HEADERS  = int32(70015)
-	headerTipFileName         = "header_tip.json"
+	BLOCK_BODY_SCAN_MAX_AGE    = 45 * time.Minute
+	BLOCK_BODY_SCAN_MAX_DEPTH  = 24
+	MAX_HEADER_RING            = 2000
+	MAX_BLOCK_FETCH_INV        = 8 // allow Dogecoin multi-block bursts without skipping
+	MAX_PENDING_BLOCKS         = 12
+	PENDING_BLOCK_TIMEOUT      = 45 * time.Second // abandon getdata that never returns (session churn)
+	CONFIRMATION_CATCHUP_DEPTH = 64               // sequential resume window toward tip
+	GETHEADERS_TOPUP_SEC       = 120              // slower while watching payments
+	GETHEADERS_TOPUP_IDLE_SEC  = 45               // faster tip tracking when no watchers
+	PROTOCOL_VERSION_HEADERS   = int32(70015)
+	headerTipFileName          = "header_tip.json"
+
+	// Genesis hashes for cold-start getheaders when no tip / no configured checkpoint.
+	// Mainnet + legacy testnet3: Dogecoin Core chainparams.cpp
+	// Reboot testnet: DogeGo https://github.com/qlpqlp/dogego (chain/testnet.go)
+	mainnetGenesisHashHex       = "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691"
+	testnetGenesisHashHex       = "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e"
+	rebootTestnetGenesisHashHex = "d5d619f8be025d4700940883c86f271d08cffa8dd1d3d4afa474c9ed9e8b68a0"
 )
 
 type storedHeader struct {
@@ -68,6 +75,10 @@ type HeaderTracker struct {
 	tipHeight      int64 // -1 unknown
 	tipHeader80    []byte
 	persistPath    string
+	network        string // mainnet | testnet | reboottestnet
+	checkpointHash string // optional cold-start locator / tip seed
+	checkpointH    int64  // height for checkpointHash; -1 unknown
+	peerStartH     int32  // last peer version start_height; applied once tip is recent
 	headersSeen    int64
 	blocksScanned  int64
 	confirmedHits  int64
@@ -84,12 +95,14 @@ type HeaderTracker struct {
 
 func NewHeaderTracker(persistDir string) *HeaderTracker {
 	h := &HeaderTracker{
-		byHash:             make(map[string]*storedHeader),
-		scanned:            make(map[string]struct{}),
-		pending:            make(map[string]time.Time),
-		tipHeight:          -1,
-		scanningHeight:     -1,
-		lastScannedHeight:  -1,
+		byHash:            make(map[string]*storedHeader),
+		scanned:           make(map[string]struct{}),
+		pending:           make(map[string]time.Time),
+		tipHeight:         -1,
+		scanningHeight:    -1,
+		lastScannedHeight: -1,
+		checkpointH:       -1,
+		network:           "mainnet",
 	}
 	if persistDir != "" {
 		h.persistPath = filepath.Join(persistDir, headerTipFileName)
@@ -98,6 +111,83 @@ func NewHeaderTracker(persistDir string) *HeaderTracker {
 		h.mu.Unlock()
 	}
 	return h
+}
+
+func (h *HeaderTracker) SetNetwork(network string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := strings.ToLower(strings.TrimSpace(network))
+	if n == "" {
+		n = "mainnet"
+	}
+	h.network = n
+}
+
+// SetStartCheckpoint configures an optional cold-start locator. When tip is empty,
+// the checkpoint is used instead of genesis, and tip is seeded so getheaders starts there.
+// height may be -1 when unknown.
+func (h *HeaderTracker) SetStartCheckpoint(hashHex string, height int64) {
+	hashHex = strings.ToLower(strings.TrimSpace(hashHex))
+	hashHex = strings.TrimPrefix(hashHex, "0x")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.checkpointHash = ""
+	h.checkpointH = -1
+	if hashHex == "" {
+		return
+	}
+	if len(hashHex) != 64 {
+		return
+	}
+	if _, err := hex.DecodeString(hashHex); err != nil {
+		return
+	}
+	h.checkpointHash = hashHex
+	if height >= 0 {
+		h.checkpointH = height
+	} else {
+		h.checkpointH = -1
+	}
+	// Seed tip only when we have nothing persisted yet.
+	if h.tipHash == "" {
+		h.tipHash = hashHex
+		h.tipHeight = h.checkpointH
+		h.tipTime = time.Time{}
+		h.tipHeader80 = nil
+		if h.checkpointH >= 0 {
+			h.byHash[hashHex] = &storedHeader{
+				HashHex: hashHex,
+				Height:  h.checkpointH,
+			}
+			h.order = append(h.order, hashHex)
+		}
+		h.saveTipLocked()
+	}
+}
+
+func (h *HeaderTracker) genesisHashHex() string {
+	switch strings.ToLower(strings.TrimSpace(h.network)) {
+	case "reboottestnet", "reboot", "reboot-testnet":
+		return rebootTestnetGenesisHashHex
+	case "testnet", "testnet3":
+		return testnetGenesisHashHex
+	default:
+		return mainnetGenesisHashHex
+	}
+}
+
+func (h *HeaderTracker) coldStartLocatorHex() string {
+	if h.checkpointHash != "" {
+		return h.checkpointHash
+	}
+	return h.genesisHashHex()
+}
+
+// NeedsHeaderSync is true until we have a tip with a plausible height (cold start / empty disk).
+func (h *HeaderTracker) NeedsHeaderSync() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.tipHash == "" || h.tipHeight < 0
 }
 
 func headerHashHex(h80 []byte) string {
@@ -527,15 +617,20 @@ func (h *HeaderTracker) markHeaderOnlyLocked(hashHex string) {
 	delete(h.pending, hashHex)
 }
 
-// NotePeerStartHeight adopts peer tip height only when our tip looks current
-// (so long catch-up from a resumed old tip does not stamp the wrong height).
+// NotePeerStartHeight remembers the peer's advertised tip height and adopts it when
+// our tip hash is already set and looks recent (so catch-up does not stamp a wrong height).
 func (h *HeaderTracker) NotePeerStartHeight(peerHeight int32) {
 	if peerHeight <= 0 {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.tipHash == "" {
+	h.peerStartH = peerHeight
+	h.maybeAdoptPeerHeightLocked()
+}
+
+func (h *HeaderTracker) maybeAdoptPeerHeightLocked() {
+	if h.peerStartH <= 0 || h.tipHash == "" {
 		return
 	}
 	if h.tipHeight >= 0 {
@@ -544,7 +639,7 @@ func (h *HeaderTracker) NotePeerStartHeight(peerHeight int32) {
 	if h.tipTime.IsZero() || time.Since(h.tipTime) > 30*time.Minute {
 		return
 	}
-	h.tipHeight = int64(peerHeight)
+	h.tipHeight = int64(h.peerStartH)
 	if sh, ok := h.byHash[h.tipHash]; ok {
 		sh.Height = h.tipHeight
 	}
@@ -608,6 +703,7 @@ func (h *HeaderTracker) RememberHeader80(h80 []byte) (hashHex string, isNew bool
 			h.tipHeight = height
 		}
 		h.saveTipLocked()
+		h.maybeAdoptPeerHeightLocked()
 	} else if !h.tipTime.IsZero() && ts.After(h.tipTime) {
 		h.tipHash = hashHex
 		h.tipTime = ts
@@ -618,6 +714,7 @@ func (h *HeaderTracker) RememberHeader80(h80 []byte) (hashHex string, isNew bool
 			h.tipHeight = -1
 		}
 		h.saveTipLocked()
+		h.maybeAdoptPeerHeightLocked()
 	}
 
 	// Keep old headers for the 24h ring/locator, but do not schedule full body downloads.
@@ -954,9 +1051,6 @@ func (h *HeaderTracker) LocatorHashes(max int) [][32]byte {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	if h.tipHash == "" {
-		return nil
-	}
 	out := make([][32]byte, 0, max)
 	seen := make(map[string]struct{})
 	cur := h.tipHash
@@ -990,6 +1084,15 @@ func (h *HeaderTracker) LocatorHashes(max int) [][32]byte {
 			step *= 2
 		}
 		cur = next
+	}
+	// Cold start: empty locator is ignored by peers — use configured checkpoint or genesis.
+	if len(out) == 0 {
+		wire, err := wireHashFromDisplayHex(h.coldStartLocatorHex())
+		if err == nil {
+			var arr [32]byte
+			copy(arr[:], wire)
+			out = append(out, arr)
+		}
 	}
 	return out
 }
